@@ -1,22 +1,18 @@
-Yes — that’s exactly the right way to do it ✅
-Your “red boundary” is basically:
-Cut LEFT (remove template column)
-Cut RIGHT (remove right template strip)
-Cut BOTTOM (remove title block)
-Then cut TOP (only slightly, and only for the remaining region)
-So we should not use contours/polygons at all.
-We should do a 4-sided crop detection using line-density / projection profiles, but in a staged way:
-✅ Best Approach (matches your requirement)
-Stage 1: Detect left + right crop from vertical line density
-Stage 2: Detect bottom crop from horizontal line density
-Stage 3: After cropping L/R/B, detect top crop inside remaining ROI
-This avoids the top header strip confusing the left/right detection.
-✅ Final Working Code (4-side staged crop)
-Install
-Copy code
-Bash
-pip install opencv-python numpy pymupdf
-Script: extract_red_boundary_crop.py
+Got it — that means your line-density thresholds are too aggressive, so it’s thinking the “template area” extends deeper into the page than it actually does.
+✅ Fix = make the left/right/bottom detection less sensitive and more stable by:
+Key changes
+Use only the strongest “template separator lines” (not every small line)
+Detect one dominant vertical separator on left and one on right
+Detect one dominant horizontal separator at bottom
+Add bounds so it can’t crop beyond reasonable limits
+This works really well for standardized drawings like yours.
+✅ Final Stable Version (Bounded + less aggressive)
+What it guarantees
+Left crop will never exceed 25% of width
+Right crop will never exceed 25% of width
+Bottom crop will never exceed 35% of height
+Top crop is still detected last (as you wanted)
+✅ Script: extract_red_crop_bounded.py
 Copy code
 Python
 import os
@@ -25,9 +21,6 @@ import numpy as np
 import fitz
 
 
-# ----------------------------
-# PDF -> Image
-# ----------------------------
 def pdf_page_to_image(pdf_path, page_number=0, dpi=500):
     doc = fitz.open(pdf_path)
     page = doc.load_page(page_number)
@@ -43,25 +36,18 @@ def pdf_page_to_image(pdf_path, page_number=0, dpi=500):
     return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
 
 
-# ----------------------------
-# Projection helpers
-# ----------------------------
-def compute_binary_lines(gray):
-    """
-    Make a binary image where lines/text are white.
-    """
-    th = cv2.adaptiveThreshold(
+def compute_binary(gray):
+    return cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
         35, 5
     )
-    return th
 
 
 def extract_vertical_lines(bin_img):
     H, W = bin_img.shape[:2]
-    v_len = max(50, H // 15)
+    v_len = max(80, H // 10)  # longer -> only strong long borders survive
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
     v = cv2.erode(bin_img, v_kernel, iterations=1)
     v = cv2.dilate(v, v_kernel, iterations=2)
@@ -70,133 +56,123 @@ def extract_vertical_lines(bin_img):
 
 def extract_horizontal_lines(bin_img):
     H, W = bin_img.shape[:2]
-    h_len = max(50, W // 15)
+    h_len = max(80, W // 10)
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
     h = cv2.erode(bin_img, h_kernel, iterations=1)
     h = cv2.dilate(h, h_kernel, iterations=2)
     return h
 
 
-def find_left_cut(vertical_lines, threshold=0.10, max_search_ratio=0.40):
+def find_left_separator(vlines, W, max_left_ratio=0.25):
     """
-    Find where the left template ends.
-    threshold is a ratio of active pixels per column.
+    Find the strongest vertical line near the left side.
     """
-    H, W = vertical_lines.shape[:2]
-    col_sum = np.sum(vertical_lines > 0, axis=0)
+    H = vlines.shape[0]
+    col_sum = np.sum(vlines > 0, axis=0)
     col_ratio = col_sum / float(H)
 
-    max_x = int(max_search_ratio * W)
-    left_end = 0
+    max_x = int(max_left_ratio * W)
+    search = col_ratio[:max_x]
 
-    for x in range(max_x):
-        if col_ratio[x] > threshold:
-            left_end = x
-
-    return left_end
+    # pick peak column (strongest vertical separator)
+    x = int(np.argmax(search))
+    return x
 
 
-def find_right_cut(vertical_lines, threshold=0.10, max_search_ratio=0.40):
+def find_right_separator(vlines, W, max_right_ratio=0.25):
     """
-    Find where the right template starts.
+    Find the strongest vertical line near the right side.
     """
-    H, W = vertical_lines.shape[:2]
-    col_sum = np.sum(vertical_lines > 0, axis=0)
+    H = vlines.shape[0]
+    col_sum = np.sum(vlines > 0, axis=0)
     col_ratio = col_sum / float(H)
 
-    min_x = int((1.0 - max_search_ratio) * W)
-    right_start = W - 1
+    min_x = int((1.0 - max_right_ratio) * W)
+    search = col_ratio[min_x:]
 
-    for x in range(W - 1, min_x, -1):
-        if col_ratio[x] > threshold:
-            right_start = x
-
-    return right_start
+    x = int(np.argmax(search)) + min_x
+    return x
 
 
-def find_bottom_cut(horizontal_lines, threshold=0.08, max_search_ratio=0.50):
+def find_bottom_separator(hlines, H, max_bottom_ratio=0.35):
     """
-    Find where the bottom title block starts.
+    Find strongest horizontal line near bottom.
     """
-    H, W = horizontal_lines.shape[:2]
-    row_sum = np.sum(horizontal_lines > 0, axis=1)
+    W = hlines.shape[1]
+    row_sum = np.sum(hlines > 0, axis=1)
     row_ratio = row_sum / float(W)
 
-    min_y = int((1.0 - max_search_ratio) * H)
-    bottom_start = H - 1
+    min_y = int((1.0 - max_bottom_ratio) * H)
+    search = row_ratio[min_y:]
 
-    for y in range(H - 1, min_y, -1):
-        if row_ratio[y] > threshold:
-            bottom_start = y
-
-    return bottom_start
+    y = int(np.argmax(search)) + min_y
+    return y
 
 
-def find_top_cut(horizontal_lines_roi, threshold=0.05, max_search_ratio=0.20):
+def find_top_separator(hlines_roi, max_top_ratio=0.20):
     """
-    Find where top header ends INSIDE the already cropped ROI.
+    Find strongest horizontal line near top inside ROI.
     """
-    H, W = horizontal_lines_roi.shape[:2]
-    row_sum = np.sum(horizontal_lines_roi > 0, axis=1)
+    H, W = hlines_roi.shape[:2]
+    row_sum = np.sum(hlines_roi > 0, axis=1)
     row_ratio = row_sum / float(W)
 
-    max_y = int(max_search_ratio * H)
-    top_end = 0
+    max_y = int(max_top_ratio * H)
+    search = row_ratio[:max_y]
 
-    for y in range(max_y):
-        if row_ratio[y] > threshold:
-            top_end = y
-
-    return top_end
+    y = int(np.argmax(search))
+    return y
 
 
-# ----------------------------
-# Main staged crop
-# ----------------------------
-def extract_red_boundary_crop(image_bgr, padding=20, debug=False):
+def extract_red_boundary_crop(image_bgr, pad_lr=15, pad_bottom=15, pad_top=10, debug=False):
+    """
+    Less aggressive cropping:
+    - Find ONE separator line left, right, bottom
+    - Crop inside them with small padding
+    - Then crop top inside ROI
+    """
     H, W = image_bgr.shape[:2]
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    bin_img = compute_binary_lines(gray)
-
-    # Extract strong vertical/horizontal template lines
+    bin_img = compute_binary(gray)
     vlines = extract_vertical_lines(bin_img)
     hlines = extract_horizontal_lines(bin_img)
 
-    # ---- Stage 1: LEFT + RIGHT crop ----
-    left_end = find_left_cut(vlines, threshold=0.10, max_search_ratio=0.45)
-    right_start = find_right_cut(vlines, threshold=0.10, max_search_ratio=0.45)
+    # Stage 1: left + right separators
+    left_sep = find_left_separator(vlines, W, max_left_ratio=0.25)
+    right_sep = find_right_separator(vlines, W, max_right_ratio=0.25)
 
-    x1 = max(0, left_end + padding)
-    x2 = min(W, right_start - padding)
+    # ensure ordering
+    if right_sep <= left_sep:
+        raise RuntimeError("Bad left/right separators. Check line extraction.")
 
-    if x2 <= x1:
-        raise RuntimeError("Invalid left/right crop. Tune thresholds or padding.")
+    x1 = max(0, left_sep + pad_lr)
+    x2 = min(W, right_sep - pad_lr)
 
-    # ---- Stage 2: BOTTOM crop (using full width, but we can also use cropped width) ----
-    bottom_start = find_bottom_cut(hlines, threshold=0.08, max_search_ratio=0.55)
-    y2 = min(H, bottom_start - padding)
+    # Stage 2: bottom separator
+    bottom_sep = find_bottom_separator(hlines, H, max_bottom_ratio=0.35)
+    y2 = min(H, bottom_sep - pad_bottom)
 
-    if y2 <= 0:
-        raise RuntimeError("Invalid bottom crop. Tune threshold/padding.")
+    if x2 <= x1 or y2 <= 0:
+        raise RuntimeError("Invalid crop after L/R/B stage. Reduce padding.")
 
-    # ---- Stage 3: TOP crop (only inside the ROI after L/R/B crop) ----
-    roi_hlines = hlines[0:y2, x1:x2]
-    top_end = find_top_cut(roi_hlines, threshold=0.05, max_search_ratio=0.25)
+    # Stage 3: top separator inside ROI
+    roi_hlines = hlines[:y2, x1:x2]
+    top_sep = find_top_separator(roi_hlines, max_top_ratio=0.20)
 
-    y1 = max(0, top_end + padding)
+    y1 = max(0, top_sep + pad_top)
 
     if y2 <= y1:
-        raise RuntimeError("Invalid top crop. Tune top threshold/padding.")
+        raise RuntimeError("Invalid crop after top stage. Reduce pad_top.")
 
     cropped = image_bgr[y1:y2, x1:x2].copy()
 
     info = {
         "crop_box": (x1, y1, x2, y2),
-        "left_end": left_end,
-        "right_start": right_start,
-        "bottom_start": bottom_start,
-        "top_end": top_end,
+        "left_sep": left_sep,
+        "right_sep": right_sep,
+        "bottom_sep": bottom_sep,
+        "top_sep": top_sep,
     }
 
     if debug:
@@ -214,9 +190,6 @@ def extract_red_boundary_crop(image_bgr, padding=20, debug=False):
     return cropped, info
 
 
-# ----------------------------
-# Batch processing PDFs
-# ----------------------------
 def process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=None):
     os.makedirs(out_dir, exist_ok=True)
     if debug_dir:
@@ -231,11 +204,9 @@ def process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=None):
 
         try:
             img = pdf_page_to_image(pdf_path, page_number=0, dpi=dpi)
-            cropped, info = extract_red_boundary_crop(img, padding=20, debug=bool(debug_dir))
+            cropped, info = extract_red_boundary_crop(img, debug=bool(debug_dir))
 
-            out_path = os.path.join(out_dir, f"{base}_extracted.png")
-            cv2.imwrite(out_path, cropped)
-
+            cv2.imwrite(os.path.join(out_dir, f"{base}_extracted.png"), cropped)
             print(f"[OK] {fname} -> crop={info['crop_box']}")
 
             if debug_dir and "debug_images" in info:
@@ -249,30 +220,24 @@ def process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=None):
 if __name__ == "__main__":
     pdf_dir = "input_pdfs"
     out_dir = "output_extracted"
-    debug_dir = "debug_outputs"  # set None to disable debug
+    debug_dir = "debug_outputs"  # set None to disable
 
     process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=debug_dir)
-🔧 Tuning knobs (you will likely adjust these once)
-Inside extract_red_boundary_crop():
-If left crop is not enough:
+✅ If left/right/bottom are STILL too much
+Reduce padding first:
 Copy code
 Python
-left_end = find_left_cut(vlines, threshold=0.08, max_search_ratio=0.50)
-If right crop is not enough:
-Copy code
-Python
-right_start = find_right_cut(vlines, threshold=0.08, max_search_ratio=0.50)
-If bottom crop is not enough:
-Copy code
-Python
-bottom_start = find_bottom_cut(hlines, threshold=0.06, max_search_ratio=0.60)
-If top crop removes too much:
-Copy code
-Python
-top_end = find_top_cut(roi_hlines, threshold=0.07, max_search_ratio=0.20)
-✅ Why this will match your red crop
-Because it does exactly what you described:
-Left/Right/Bottom cropping using global template lines
-Then Top crop only after the other 3 sides are fixed
-So the top strip doesn’t “pollute” the left/right decision.
-If you want, I can also make this return the crop in PDF coordinates so you can crop the PDF directly (without converting to image).
+cropped, info = extract_red_boundary_crop(
+    img,
+    pad_lr=5,
+    pad_bottom=5,
+    pad_top=10
+)
+And if it’s still too much, reduce the “max crop bounds”:
+Left bound from 0.25 → 0.20
+Right bound from 0.25 → 0.20
+Bottom bound from 0.35 → 0.30
+Why this version won’t overcrop
+Instead of “everything above threshold”, we pick the single strongest separator line in a limited region.
+So it won’t accidentally interpret internal drawing lines as template boundary.
+If you want, I can add a debug image that draws the detected separator lines (left/right/bottom/top) so you can see exactly what it’s locking onto.
