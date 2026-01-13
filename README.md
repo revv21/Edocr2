@@ -1,29 +1,28 @@
-Yep — in your example the outer sheet border is a perfect strong rectangle, so any “largest contour / strongest rectangle” logic will always lock onto it first.
-To avoid the outer border, you need to do 2-stage detection:
-✅ Stage 1: detect the outer border rectangle
-✅ Stage 2: remove/ignore a margin band near the outer border
-✅ Stage 3: search for the next largest closed polygon/contour inside (your drawing region)
-This guarantees you don’t pick the sheet border.
-✅ Best Fix for Your Case (Outer border ignored)
-What this code does
-Convert PDF → high DPI image
-Threshold
-Detect outer border rectangle
-Create an “inner search ROI” by shrinking inside that border
-Find the largest closed contour inside ROI
-Crop to that contour’s bounding box
-✅ Final Working Code (PDF → ignore outer border → extract inner drawing polygon)
+Yes — that’s exactly the right way to do it ✅
+Your “red boundary” is basically:
+Cut LEFT (remove template column)
+Cut RIGHT (remove right template strip)
+Cut BOTTOM (remove title block)
+Then cut TOP (only slightly, and only for the remaining region)
+So we should not use contours/polygons at all.
+We should do a 4-sided crop detection using line-density / projection profiles, but in a staged way:
+✅ Best Approach (matches your requirement)
+Stage 1: Detect left + right crop from vertical line density
+Stage 2: Detect bottom crop from horizontal line density
+Stage 3: After cropping L/R/B, detect top crop inside remaining ROI
+This avoids the top header strip confusing the left/right detection.
+✅ Final Working Code (4-side staged crop)
 Install
 Copy code
 Bash
 pip install opencv-python numpy pymupdf
-Script: extract_drawing_ignore_outer_border.py
+Script: extract_red_boundary_crop.py
 Copy code
 Python
 import os
 import cv2
 import numpy as np
-import fitz  # PyMuPDF
+import fitz
 
 
 # ----------------------------
@@ -45,155 +44,170 @@ def pdf_page_to_image(pdf_path, page_number=0, dpi=500):
 
 
 # ----------------------------
-# Helpers
+# Projection helpers
 # ----------------------------
-def find_outer_border_rect(binary_img, min_area_ratio=0.80):
+def compute_binary_lines(gray):
     """
-    Find the outer sheet border rectangle.
-    binary_img should have lines as white (255).
-    Returns bounding box (x1,y1,x2,y2) of outer border.
+    Make a binary image where lines/text are white.
     """
-    H, W = binary_img.shape[:2]
-    contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return None
-
-    page_area = H * W
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < min_area_ratio * page_area:
-            continue
-
-        # Approx polygon
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.01 * peri, True)
-
-        # Outer border usually is a 4-corner-ish contour
-        x, y, w, h = cv2.boundingRect(approx)
-        return (x, y, x + w, y + h)
-
-    # fallback: take largest contour bbox
-    x, y, w, h = cv2.boundingRect(contours[0])
-    return (x, y, x + w, y + h)
-
-
-def extract_largest_inner_contour(binary_img, roi_box, min_area_ratio=0.02):
-    """
-    Search for largest contour inside ROI.
-    """
-    x1, y1, x2, y2 = roi_box
-    roi = binary_img[y1:y2, x1:x2]
-
-    contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    roi_area = (y2 - y1) * (x2 - x1)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < min_area_ratio * roi_area:
-            continue
-        return cnt, (x1, y1)  # contour + offset
-
-    return contours[0], (x1, y1)
-
-
-# ----------------------------
-# Main extraction
-# ----------------------------
-def extract_drawing_region(image_bgr, outer_shrink_ratio=0.06, padding=10, debug=False):
-    """
-    1) Threshold
-    2) Find outer border bbox
-    3) Shrink bbox to ignore template border region
-    4) Find largest contour inside -> drawing region polygon
-    5) Crop
-    """
-    H, W = image_bgr.shape[:2]
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-
-    # Adaptive threshold to make lines white
     th = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
         35, 5
     )
+    return th
 
-    # Connect broken border lines
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    # Outer border bbox
-    outer = find_outer_border_rect(closed, min_area_ratio=0.70)
-    if outer is None:
-        raise RuntimeError("Outer border not found.")
+def extract_vertical_lines(bin_img):
+    H, W = bin_img.shape[:2]
+    v_len = max(50, H // 15)
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
+    v = cv2.erode(bin_img, v_kernel, iterations=1)
+    v = cv2.dilate(v, v_kernel, iterations=2)
+    return v
 
-    ox1, oy1, ox2, oy2 = outer
 
-    # Shrink inside outer border so we never select it again
-    shrink_x = int((ox2 - ox1) * outer_shrink_ratio)
-    shrink_y = int((oy2 - oy1) * outer_shrink_ratio)
+def extract_horizontal_lines(bin_img):
+    H, W = bin_img.shape[:2]
+    h_len = max(50, W // 15)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
+    h = cv2.erode(bin_img, h_kernel, iterations=1)
+    h = cv2.dilate(h, h_kernel, iterations=2)
+    return h
 
-    ix1 = min(W - 1, ox1 + shrink_x)
-    iy1 = min(H - 1, oy1 + shrink_y)
-    ix2 = max(0, ox2 - shrink_x)
-    iy2 = max(0, oy2 - shrink_y)
 
-    if ix2 <= ix1 or iy2 <= iy1:
-        raise RuntimeError("Invalid inner ROI after shrinking. Reduce outer_shrink_ratio.")
+def find_left_cut(vertical_lines, threshold=0.10, max_search_ratio=0.40):
+    """
+    Find where the left template ends.
+    threshold is a ratio of active pixels per column.
+    """
+    H, W = vertical_lines.shape[:2]
+    col_sum = np.sum(vertical_lines > 0, axis=0)
+    col_ratio = col_sum / float(H)
 
-    # Find largest contour inside inner ROI
-    result = extract_largest_inner_contour(closed, (ix1, iy1, ix2, iy2), min_area_ratio=0.02)
-    if result is None:
-        raise RuntimeError("No inner drawing contour found inside ROI.")
+    max_x = int(max_search_ratio * W)
+    left_end = 0
 
-    cnt, (offx, offy) = result
+    for x in range(max_x):
+        if col_ratio[x] > threshold:
+            left_end = x
 
-    # Move contour back to full-image coordinates
-    cnt_full = cnt + np.array([[[offx, offy]]], dtype=np.int32)
+    return left_end
 
-    # Approx polygon (smooth)
-    peri = cv2.arcLength(cnt_full, True)
-    approx = cv2.approxPolyDP(cnt_full, 0.01 * peri, True)
 
-    # Crop bbox of polygon
-    x, y, w, h = cv2.boundingRect(approx)
-    x1 = max(0, x + padding)
-    y1 = max(0, y + padding)
-    x2 = min(W, x + w - padding)
-    y2 = min(H, y + h - padding)
+def find_right_cut(vertical_lines, threshold=0.10, max_search_ratio=0.40):
+    """
+    Find where the right template starts.
+    """
+    H, W = vertical_lines.shape[:2]
+    col_sum = np.sum(vertical_lines > 0, axis=0)
+    col_ratio = col_sum / float(H)
+
+    min_x = int((1.0 - max_search_ratio) * W)
+    right_start = W - 1
+
+    for x in range(W - 1, min_x, -1):
+        if col_ratio[x] > threshold:
+            right_start = x
+
+    return right_start
+
+
+def find_bottom_cut(horizontal_lines, threshold=0.08, max_search_ratio=0.50):
+    """
+    Find where the bottom title block starts.
+    """
+    H, W = horizontal_lines.shape[:2]
+    row_sum = np.sum(horizontal_lines > 0, axis=1)
+    row_ratio = row_sum / float(W)
+
+    min_y = int((1.0 - max_search_ratio) * H)
+    bottom_start = H - 1
+
+    for y in range(H - 1, min_y, -1):
+        if row_ratio[y] > threshold:
+            bottom_start = y
+
+    return bottom_start
+
+
+def find_top_cut(horizontal_lines_roi, threshold=0.05, max_search_ratio=0.20):
+    """
+    Find where top header ends INSIDE the already cropped ROI.
+    """
+    H, W = horizontal_lines_roi.shape[:2]
+    row_sum = np.sum(horizontal_lines_roi > 0, axis=1)
+    row_ratio = row_sum / float(W)
+
+    max_y = int(max_search_ratio * H)
+    top_end = 0
+
+    for y in range(max_y):
+        if row_ratio[y] > threshold:
+            top_end = y
+
+    return top_end
+
+
+# ----------------------------
+# Main staged crop
+# ----------------------------
+def extract_red_boundary_crop(image_bgr, padding=20, debug=False):
+    H, W = image_bgr.shape[:2]
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    bin_img = compute_binary_lines(gray)
+
+    # Extract strong vertical/horizontal template lines
+    vlines = extract_vertical_lines(bin_img)
+    hlines = extract_horizontal_lines(bin_img)
+
+    # ---- Stage 1: LEFT + RIGHT crop ----
+    left_end = find_left_cut(vlines, threshold=0.10, max_search_ratio=0.45)
+    right_start = find_right_cut(vlines, threshold=0.10, max_search_ratio=0.45)
+
+    x1 = max(0, left_end + padding)
+    x2 = min(W, right_start - padding)
+
+    if x2 <= x1:
+        raise RuntimeError("Invalid left/right crop. Tune thresholds or padding.")
+
+    # ---- Stage 2: BOTTOM crop (using full width, but we can also use cropped width) ----
+    bottom_start = find_bottom_cut(hlines, threshold=0.08, max_search_ratio=0.55)
+    y2 = min(H, bottom_start - padding)
+
+    if y2 <= 0:
+        raise RuntimeError("Invalid bottom crop. Tune threshold/padding.")
+
+    # ---- Stage 3: TOP crop (only inside the ROI after L/R/B crop) ----
+    roi_hlines = hlines[0:y2, x1:x2]
+    top_end = find_top_cut(roi_hlines, threshold=0.05, max_search_ratio=0.25)
+
+    y1 = max(0, top_end + padding)
+
+    if y2 <= y1:
+        raise RuntimeError("Invalid top crop. Tune top threshold/padding.")
 
     cropped = image_bgr[y1:y2, x1:x2].copy()
 
     info = {
-        "outer_border_box": outer,
-        "inner_roi_box": (ix1, iy1, ix2, iy2),
-        "final_crop_box": (x1, y1, x2, y2),
-        "polygon_points": len(approx),
+        "crop_box": (x1, y1, x2, y2),
+        "left_end": left_end,
+        "right_start": right_start,
+        "bottom_start": bottom_start,
+        "top_end": top_end,
     }
 
     if debug:
-        dbg = image_bgr.copy()
-
-        # Draw outer border (blue)
-        cv2.rectangle(dbg, (ox1, oy1), (ox2, oy2), (255, 0, 0), 4)
-
-        # Draw inner ROI (green)
-        cv2.rectangle(dbg, (ix1, iy1), (ix2, iy2), (0, 255, 0), 3)
-
-        # Draw chosen polygon (red)
-        cv2.drawContours(dbg, [approx], -1, (0, 0, 255), 3)
+        overlay = image_bgr.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), 4)
 
         info["debug_images"] = {
-            "threshold": th,
-            "closed": closed,
-            "debug_overlay": dbg,
+            "binary": bin_img,
+            "vlines": vlines,
+            "hlines": hlines,
+            "overlay": overlay,
             "cropped": cropped,
         }
 
@@ -201,7 +215,7 @@ def extract_drawing_region(image_bgr, outer_shrink_ratio=0.06, padding=10, debug
 
 
 # ----------------------------
-# Batch PDF folder
+# Batch processing PDFs
 # ----------------------------
 def process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=None):
     os.makedirs(out_dir, exist_ok=True)
@@ -217,15 +231,12 @@ def process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=None):
 
         try:
             img = pdf_page_to_image(pdf_path, page_number=0, dpi=dpi)
-            cropped, info = extract_drawing_region(
-                img,
-                outer_shrink_ratio=0.06,  # increase if it still picks outer border
-                padding=10,
-                debug=bool(debug_dir),
-            )
+            cropped, info = extract_red_boundary_crop(img, padding=20, debug=bool(debug_dir))
 
-            cv2.imwrite(os.path.join(out_dir, f"{base}_drawing.png"), cropped)
-            print(f"[OK] {fname} -> extracted | polygon_pts={info['polygon_points']}")
+            out_path = os.path.join(out_dir, f"{base}_extracted.png")
+            cv2.imwrite(out_path, cropped)
+
+            print(f"[OK] {fname} -> crop={info['crop_box']}")
 
             if debug_dir and "debug_images" in info:
                 for k, v in info["debug_images"].items():
@@ -238,30 +249,30 @@ def process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=None):
 if __name__ == "__main__":
     pdf_dir = "input_pdfs"
     out_dir = "output_extracted"
-    debug_dir = "debug_outputs"  # set None to disable debug outputs
+    debug_dir = "debug_outputs"  # set None to disable debug
 
     process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=debug_dir)
-✅ What you should tweak for your template
-If it STILL picks the outer border:
-Increase shrink:
+🔧 Tuning knobs (you will likely adjust these once)
+Inside extract_red_boundary_crop():
+If left crop is not enough:
 Copy code
 Python
-outer_shrink_ratio=0.10
-If it crops too much inside:
-Reduce shrink:
+left_end = find_left_cut(vlines, threshold=0.08, max_search_ratio=0.50)
+If right crop is not enough:
 Copy code
 Python
-outer_shrink_ratio=0.04
-If it fails to find inner contour:
-Increase morphology:
+right_start = find_right_cut(vlines, threshold=0.08, max_search_ratio=0.50)
+If bottom crop is not enough:
 Copy code
 Python
-kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=3)
-⭐ Why this works on your sample
-Your sheet has:
-a very strong outer border
-a strong template on left/bottom
-drawing in the middle
-By shrinking inside the outer border first, we force the algorithm to look for the next biggest closed region, which will be your drawing polygon.
-If you want, I can also modify this to output a transparent PNG mask (template fully removed, only drawing visible).
+bottom_start = find_bottom_cut(hlines, threshold=0.06, max_search_ratio=0.60)
+If top crop removes too much:
+Copy code
+Python
+top_end = find_top_cut(roi_hlines, threshold=0.07, max_search_ratio=0.20)
+✅ Why this will match your red crop
+Because it does exactly what you described:
+Left/Right/Bottom cropping using global template lines
+Then Top crop only after the other 3 sides are fixed
+So the top strip doesn’t “pollute” the left/right decision.
+If you want, I can also make this return the crop in PDF coordinates so you can crop the PDF directly (without converting to image).
