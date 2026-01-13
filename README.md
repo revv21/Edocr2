@@ -1,120 +1,143 @@
-From your screenshot the script is failing with:
-No rectangle candidates found. Try increasing DPI or morphology kernel size.
-That means your binary image doesn’t contain a clean closed rectangular contour, so findContours() never sees a “rectangle”.
-This usually happens because:
-the border lines are too thin / broken
-the image is low resolution
-the page is not properly thresholded
-the rectangle is split into multiple contours
-✅ Fix (most reliable): detect inner rectangle using LINE EXTRACTION (not contours)
-Instead of relying on “closed contour rectangles”, we explicitly extract:
-horizontal lines
-vertical lines then combine them → the inner frame becomes a strong rectangle.
-This works MUCH better for engineering drawings.
-✅ Final working code (inner frame using morphology line detection)
-Save as: extract_inner_frame_lines.py
+Perfect — if they’re proper PDFs converted to images, then the #1 reason all these methods fail is the conversion DPI is too low (inner border becomes 1–2 px thin and breaks).
+So the best fix is:
+✅ Convert PDF → image at 400–600 DPI
+✅ Then run Hough-line inner frame detection
+Below is a final end-to-end code that does BOTH:
+✅ Final Solution (PDF → High DPI image → inner frame crop)
+1) Install
+Copy code
+Bash
+pip install opencv-python numpy pymupdf
+✅ Script: pdf_crop_inner_frame.py
 Copy code
 Python
 import os
 import cv2
 import numpy as np
+import fitz  # PyMuPDF
 
 
-def extract_inner_frame_using_lines(image_bgr, padding=15, debug=False):
+# ----------------------------
+# PDF -> Image (High DPI)
+# ----------------------------
+def pdf_page_to_image(pdf_path, page_number=0, dpi=500):
     """
-    Robust inner-frame extractor:
-    - binarize
-    - extract horizontal + vertical lines using morphology
-    - combine -> strong rectangle structure
-    - find rectangles -> choose inner frame
+    Convert a PDF page to a high-resolution BGR image using PyMuPDF.
+    dpi=400-600 is recommended for engineering drawings.
     """
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_number)
 
-    h, w = image_bgr.shape[:2]
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
 
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+
+    # Convert to BGR for OpenCV
+    if pix.n == 3:
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    else:
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+
+    return img_bgr
+
+
+# ----------------------------
+# Inner frame using Hough lines
+# ----------------------------
+def extract_inner_frame_hough(image_bgr, padding=15, debug=False):
+    H, W = image_bgr.shape[:2]
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Stronger threshold for scanned/low-contrast images
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    th = cv2.adaptiveThreshold(
-        blur, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        35, 5
+    # Enhance contrast
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+
+    # Light blur
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # Strong edges
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+    # Hough line detection
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=120,
+        minLineLength=int(0.30 * min(H, W)),
+        maxLineGap=40
     )
 
-    # --- Extract horizontal lines ---
-    horiz_kernel_len = max(30, w // 20)   # tune if needed
-    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horiz_kernel_len, 1))
-    horizontal = cv2.erode(th, horiz_kernel, iterations=1)
-    horizontal = cv2.dilate(horizontal, horiz_kernel, iterations=2)
+    if lines is None:
+        raise RuntimeError("No Hough lines detected. Try increasing DPI or lowering Hough threshold.")
 
-    # --- Extract vertical lines ---
-    vert_kernel_len = max(30, h // 20)    # tune if needed
-    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vert_kernel_len))
-    vertical = cv2.erode(th, vert_kernel, iterations=1)
-    vertical = cv2.dilate(vertical, vert_kernel, iterations=2)
+    vertical = []
+    horizontal = []
 
-    # Combine line maps
-    lines = cv2.bitwise_or(horizontal, vertical)
+    for x1, y1, x2, y2 in lines[:, 0]:
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
 
-    # Close small gaps in frame
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    lines_closed = cv2.morphologyEx(lines, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+        # horizontal
+        if dy < 12 and dx > 0.35 * W:
+            horizontal.append((x1, y1, x2, y2))
 
-    # Find contours from line structure
-    contours, _ = cv2.findContours(lines_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # vertical
+        if dx < 12 and dy > 0.35 * H:
+            vertical.append((x1, y1, x2, y2))
 
-    # Find rectangle candidates (approx polygons with 4 corners)
-    candidates = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 0.05 * (h * w):  # ignore small rectangles (tables etc.)
-            continue
+    if len(vertical) < 2 or len(horizontal) < 2:
+        raise RuntimeError(f"Not enough border lines found (v={len(vertical)}, h={len(horizontal)}).")
 
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+    vx = sorted([int((l[0] + l[2]) / 2) for l in vertical])
+    hy = sorted([int((l[1] + l[3]) / 2) for l in horizontal])
 
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            candidates.append(approx)
+    # Pick inner-most extremes but avoid absolute page edge
+    def pick_inner_extremes(vals, size):
+        margin = int(0.02 * size)
+        filtered = [v for v in vals if margin < v < (size - margin)]
+        if len(filtered) < 2:
+            filtered = vals
+        return filtered[0], filtered[-1]
 
-    if len(candidates) == 0:
-        raise RuntimeError("No rectangle candidates found (even after line extraction).")
+    left_x, right_x = pick_inner_extremes(vx, W)
+    top_y, bottom_y = pick_inner_extremes(hy, H)
 
-    # Sort by area descending
-    candidates.sort(key=lambda q: cv2.contourArea(q), reverse=True)
+    left_x, right_x = min(left_x, right_x), max(left_x, right_x)
+    top_y, bottom_y = min(top_y, bottom_y), max(top_y, bottom_y)
 
-    # Outer is largest, inner is usually 2nd largest
-    chosen = candidates[1] if len(candidates) > 1 else candidates[0]
+    x1 = max(0, left_x + padding)
+    x2 = min(W, right_x - padding)
+    y1 = max(0, top_y + padding)
+    y2 = min(H, bottom_y - padding)
 
-    pts = chosen.reshape(4, 2)
-    x_min = int(max(0, np.min(pts[:, 0]) + padding))
-    y_min = int(max(0, np.min(pts[:, 1]) + padding))
-    x_max = int(min(w, np.max(pts[:, 0]) - padding))
-    y_max = int(min(h, np.max(pts[:, 1]) - padding))
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError("Invalid crop box. Reduce padding or check detected lines.")
 
-    if x_max <= x_min or y_max <= y_min:
-        raise RuntimeError("Invalid crop box. Reduce padding or check detection.")
+    cropped = image_bgr[y1:y2, x1:x2].copy()
 
-    cropped = image_bgr[y_min:y_max, x_min:x_max].copy()
-
-    info = {"crop_box": (x_min, y_min, x_max, y_max), "num_candidates": len(candidates)}
+    info = {
+        "crop_box": (x1, y1, x2, y2),
+        "num_lines": len(lines),
+        "num_vertical": len(vertical),
+        "num_horizontal": len(horizontal),
+    }
 
     if debug:
         dbg = image_bgr.copy()
-        for i, q in enumerate(candidates[:5]):
-            cv2.polylines(dbg, [q], True, (0, 255, 0), 2)
-            cv2.putText(dbg, f"R{i}", tuple(q[0][0]), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+        for (x1l, y1l, x2l, y2l) in vertical:
+            cv2.line(dbg, (x1l, y1l), (x2l, y2l), (0, 255, 0), 2)
+        for (x1l, y1l, x2l, y2l) in horizontal:
+            cv2.line(dbg, (x1l, y1l), (x2l, y2l), (255, 0, 0), 2)
 
         chosen_dbg = image_bgr.copy()
-        cv2.polylines(chosen_dbg, [chosen], True, (0, 0, 255), 3)
+        cv2.rectangle(chosen_dbg, (x1, y1), (x2, y2), (0, 0, 255), 3)
 
         info["debug_images"] = {
-            "threshold": th,
-            "horizontal": horizontal,
-            "vertical": vertical,
-            "lines": lines,
-            "lines_closed": lines_closed,
-            "rect_candidates": dbg,
+            "edges": edges,
+            "all_lines": dbg,
             "chosen_rect": chosen_dbg,
             "cropped": cropped,
         }
@@ -122,32 +145,31 @@ def extract_inner_frame_using_lines(image_bgr, padding=15, debug=False):
     return cropped, info
 
 
-def process_folder(input_dir, output_dir, debug_dir=None):
-    os.makedirs(output_dir, exist_ok=True)
+# ----------------------------
+# Batch processing PDFs
+# ----------------------------
+def process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=None):
+    os.makedirs(out_dir, exist_ok=True)
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
 
-    valid_exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
-
-    for fname in os.listdir(input_dir):
-        if not fname.lower().endswith(valid_exts):
+    for fname in os.listdir(pdf_dir):
+        if not fname.lower().endswith(".pdf"):
             continue
 
-        in_path = os.path.join(input_dir, fname)
-        img = cv2.imread(in_path)
-        if img is None:
-            print(f"[WARN] Could not read: {in_path}")
-            continue
+        pdf_path = os.path.join(pdf_dir, fname)
 
         try:
-            cropped, info = extract_inner_frame_using_lines(img, padding=15, debug=bool(debug_dir))
-            out_path = os.path.join(output_dir, fname)
+            img = pdf_page_to_image(pdf_path, page_number=0, dpi=dpi)
+            cropped, info = extract_inner_frame_hough(img, padding=20, debug=bool(debug_dir))
+
+            base = os.path.splitext(fname)[0]
+            out_path = os.path.join(out_dir, f"{base}_cropped.png")
             cv2.imwrite(out_path, cropped)
 
-            print(f"[OK] {fname} -> cropped | candidates={info['num_candidates']}")
+            print(f"[OK] {fname} -> cropped | v={info['num_vertical']} h={info['num_horizontal']}")
 
             if debug_dir and "debug_images" in info:
-                base = os.path.splitext(fname)[0]
                 for k, v in info["debug_images"].items():
                     cv2.imwrite(os.path.join(debug_dir, f"{base}__{k}.png"), v)
 
@@ -156,30 +178,45 @@ def process_folder(input_dir, output_dir, debug_dir=None):
 
 
 if __name__ == "__main__":
-    input_dir = "input_images"
-    output_dir = "output_cropped"
+    pdf_dir = "input_pdfs"
+    out_dir = "output_cropped"
     debug_dir = "debug_outputs"  # set None to disable
 
-    process_folder(input_dir, output_dir, debug_dir)
-✅ Why this version will work for your case
-Contour-based rectangle detection fails when borders are broken.
-This method:
-explicitly isolates long straight lines (like sheet borders)
-reconstructs the frame even if it is broken
-then detects rectangles from that
-This is the standard robust approach for engineering drawings.
-🔧 If it still selects wrong rectangle (title block)
-Change this line:
+    process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=debug_dir)
+✅ How to run
+Folder layout
+Copy code
+
+project/
+  pdf_crop_inner_frame.py
+  input_pdfs/
+    drawing1.pdf
+    drawing2.pdf
+Run
+Copy code
+Bash
+python pdf_crop_inner_frame.py
+Outputs:
+output_cropped/*.png → cropped inner drawing region
+debug_outputs/* → debug overlays + edges
+🔧 Tuning (very important)
+If it fails on some PDFs:
+If no lines detected
+Increase DPI:
 Copy code
 Python
-chosen = candidates[1] if len(candidates) > 1 else candidates[0]
-to this:
+dpi=600
+If it detects only short lines
+Reduce minLineLength:
 Copy code
 Python
-chosen = candidates[0]  # if inner frame is actually the biggest in your images
-Or increase the minimum area filter:
+minLineLength=int(0.20 * min(H, W))
+If inner border is faint
+Increase dilation:
 Copy code
 Python
-if area < 0.10 * (h * w):
-    continue
-If you want, I can also modify this to remove title block even inside the inner frame (crop out bottom-right region automatically).
+edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=1)
+If you want the BEST possible reliability
+The next upgrade is: ✅ detect outer border first, then search inside that ROI for the inner border
+(this avoids confusing title blocks / tables)
+If you want, I’ll give that “two-stage border detection” version too.
