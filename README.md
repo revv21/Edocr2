@@ -1,14 +1,27 @@
-Perfect — if they’re proper PDFs converted to images, then the #1 reason all these methods fail is the conversion DPI is too low (inner border becomes 1–2 px thin and breaks).
-So the best fix is:
-✅ Convert PDF → image at 400–600 DPI
-✅ Then run Hough-line inner frame detection
-Below is a final end-to-end code that does BOTH:
-✅ Final Solution (PDF → High DPI image → inner frame crop)
-1) Install
+Ahh got it — that changes everything 👍
+If the actual drawing region is a closed polygon (not a rectangle), then any “inner rectangle border” method will fail / be unstable, because there simply isn’t a consistent inner rectangle to detect.
+In that case, the best classical approach is:
+✅ Detect the biggest closed polygon contour (the drawing boundary)
+→ then crop to its bounding box OR mask everything outside it
+This works even when:
+template size changes
+drawing boundary is irregular
+title block exists
+border lines are not rectangular
+✅ Best Approach for Closed Polygon Drawing Boundary
+Pipeline
+PDF → high DPI image
+Convert to grayscale + threshold
+Morphological close (connect broken boundary lines)
+Find contours
+Pick the largest closed contour that is NOT the page border
+Crop / mask using that contour
+✅ Final End-to-End Code (PDF → detect polygon → extract only drawing)
+Install
 Copy code
 Bash
 pip install opencv-python numpy pymupdf
-✅ Script: pdf_crop_inner_frame.py
+✅ Script: extract_polygon_drawing.py
 Copy code
 Python
 import os
@@ -21,10 +34,6 @@ import fitz  # PyMuPDF
 # PDF -> Image (High DPI)
 # ----------------------------
 def pdf_page_to_image(pdf_path, page_number=0, dpi=500):
-    """
-    Convert a PDF page to a high-resolution BGR image using PyMuPDF.
-    dpi=400-600 is recommended for engineering drawings.
-    """
     doc = fitz.open(pdf_path)
     page = doc.load_page(page_number)
 
@@ -34,119 +43,116 @@ def pdf_page_to_image(pdf_path, page_number=0, dpi=500):
     pix = page.get_pixmap(matrix=mat, alpha=False)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
 
-    # Convert to BGR for OpenCV
     if pix.n == 3:
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    else:
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-
-    return img_bgr
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
 
 
 # ----------------------------
-# Inner frame using Hough lines
+# Polygon extraction
 # ----------------------------
-def extract_inner_frame_hough(image_bgr, padding=15, debug=False):
+def extract_largest_polygon_region(image_bgr, padding=10, debug=False):
+    """
+    Extract the largest closed polygon region (drawing area) excluding page border.
+    Returns:
+      - cropped image (bounding box crop)
+      - masked image (everything outside polygon removed)
+    """
+
     H, W = image_bgr.shape[:2]
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Enhance contrast
+    # Improve contrast (important for light template lines)
     gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-    # Light blur
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-
-    # Strong edges
-    edges = cv2.Canny(blur, 50, 150)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-
-    # Hough line detection
-    lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=120,
-        minLineLength=int(0.30 * min(H, W)),
-        maxLineGap=40
+    # Adaptive threshold -> lines become white (foreground)
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        35, 5
     )
 
-    if lines is None:
-        raise RuntimeError("No Hough lines detected. Try increasing DPI or lowering Hough threshold.")
+    # Close gaps so polygon becomes a single closed contour
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    vertical = []
-    horizontal = []
+    # Find contours
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    for x1, y1, x2, y2 in lines[:, 0]:
-        dx = abs(x2 - x1)
-        dy = abs(y2 - y1)
+    if not contours:
+        raise RuntimeError("No contours found. Try increasing DPI or morphology kernel.")
 
-        # horizontal
-        if dy < 12 and dx > 0.35 * W:
-            horizontal.append((x1, y1, x2, y2))
+    # Sort by area descending
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
-        # vertical
-        if dx < 12 and dy > 0.35 * H:
-            vertical.append((x1, y1, x2, y2))
+    page_area = H * W
 
-    if len(vertical) < 2 or len(horizontal) < 2:
-        raise RuntimeError(f"Not enough border lines found (v={len(vertical)}, h={len(horizontal)}).")
+    chosen = None
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
 
-    vx = sorted([int((l[0] + l[2]) / 2) for l in vertical])
-    hy = sorted([int((l[1] + l[3]) / 2) for l in horizontal])
+        # Skip tiny things
+        if area < 0.05 * page_area:
+            continue
 
-    # Pick inner-most extremes but avoid absolute page edge
-    def pick_inner_extremes(vals, size):
-        margin = int(0.02 * size)
-        filtered = [v for v in vals if margin < v < (size - margin)]
-        if len(filtered) < 2:
-            filtered = vals
-        return filtered[0], filtered[-1]
+        # Skip page outer border (usually almost full page)
+        if area > 0.95 * page_area:
+            continue
 
-    left_x, right_x = pick_inner_extremes(vx, W)
-    top_y, bottom_y = pick_inner_extremes(hy, H)
+        chosen = cnt
+        break
 
-    left_x, right_x = min(left_x, right_x), max(left_x, right_x)
-    top_y, bottom_y = min(top_y, bottom_y), max(top_y, bottom_y)
+    if chosen is None:
+        # fallback: just take 2nd largest contour
+        chosen = contours[1] if len(contours) > 1 else contours[0]
 
-    x1 = max(0, left_x + padding)
-    x2 = min(W, right_x - padding)
-    y1 = max(0, top_y + padding)
-    y2 = min(H, bottom_y - padding)
+    # Approx polygon (smooth contour)
+    peri = cv2.arcLength(chosen, True)
+    approx = cv2.approxPolyDP(chosen, 0.01 * peri, True)
 
-    if x2 <= x1 or y2 <= y1:
-        raise RuntimeError("Invalid crop box. Reduce padding or check detected lines.")
+    # Bounding box crop
+    x, y, w, h = cv2.boundingRect(approx)
+    x1 = max(0, x + padding)
+    y1 = max(0, y + padding)
+    x2 = min(W, x + w - padding)
+    y2 = min(H, y + h - padding)
 
     cropped = image_bgr[y1:y2, x1:x2].copy()
 
+    # Mask everything outside polygon
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillPoly(mask, [approx], 255)
+
+    masked_full = cv2.bitwise_and(image_bgr, image_bgr, mask=mask)
+    masked_crop = masked_full[y1:y2, x1:x2].copy()
+
     info = {
-        "crop_box": (x1, y1, x2, y2),
-        "num_lines": len(lines),
-        "num_vertical": len(vertical),
-        "num_horizontal": len(horizontal),
+        "bbox": (x1, y1, x2, y2),
+        "polygon_points": len(approx),
+        "chosen_area_ratio": float(cv2.contourArea(chosen) / page_area)
     }
 
     if debug:
         dbg = image_bgr.copy()
-        for (x1l, y1l, x2l, y2l) in vertical:
-            cv2.line(dbg, (x1l, y1l), (x2l, y2l), (0, 255, 0), 2)
-        for (x1l, y1l, x2l, y2l) in horizontal:
-            cv2.line(dbg, (x1l, y1l), (x2l, y2l), (255, 0, 0), 2)
-
-        chosen_dbg = image_bgr.copy()
-        cv2.rectangle(chosen_dbg, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        cv2.drawContours(dbg, [approx], -1, (0, 0, 255), 3)
+        cv2.rectangle(dbg, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
         info["debug_images"] = {
-            "edges": edges,
-            "all_lines": dbg,
-            "chosen_rect": chosen_dbg,
-            "cropped": cropped,
+            "threshold": th,
+            "closed": closed,
+            "chosen_polygon": dbg,
+            "mask": mask,
+            "masked_full": masked_full,
+            "cropped_bbox": cropped,
+            "masked_crop": masked_crop,
         }
 
-    return cropped, info
+    return cropped, masked_crop, info
 
 
 # ----------------------------
-# Batch processing PDFs
+# Batch PDF folder
 # ----------------------------
 def process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=None):
     os.makedirs(out_dir, exist_ok=True)
@@ -158,16 +164,20 @@ def process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=None):
             continue
 
         pdf_path = os.path.join(pdf_dir, fname)
+        base = os.path.splitext(fname)[0]
 
         try:
             img = pdf_page_to_image(pdf_path, page_number=0, dpi=dpi)
-            cropped, info = extract_inner_frame_hough(img, padding=20, debug=bool(debug_dir))
 
-            base = os.path.splitext(fname)[0]
-            out_path = os.path.join(out_dir, f"{base}_cropped.png")
-            cv2.imwrite(out_path, cropped)
+            bbox_crop, masked_crop, info = extract_largest_polygon_region(
+                img, padding=10, debug=bool(debug_dir)
+            )
 
-            print(f"[OK] {fname} -> cropped | v={info['num_vertical']} h={info['num_horizontal']}")
+            # Save both versions
+            cv2.imwrite(os.path.join(out_dir, f"{base}_bbox_crop.png"), bbox_crop)
+            cv2.imwrite(os.path.join(out_dir, f"{base}_masked_crop.png"), masked_crop)
+
+            print(f"[OK] {fname} -> polygon_pts={info['polygon_points']} area_ratio={info['chosen_area_ratio']:.3f}")
 
             if debug_dir and "debug_images" in info:
                 for k, v in info["debug_images"].items():
@@ -179,44 +189,34 @@ def process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=None):
 
 if __name__ == "__main__":
     pdf_dir = "input_pdfs"
-    out_dir = "output_cropped"
+    out_dir = "output_extracted"
     debug_dir = "debug_outputs"  # set None to disable
 
     process_pdf_folder(pdf_dir, out_dir, dpi=500, debug_dir=debug_dir)
-✅ How to run
-Folder layout
-Copy code
-
-project/
-  pdf_crop_inner_frame.py
-  input_pdfs/
-    drawing1.pdf
-    drawing2.pdf
-Run
-Copy code
-Bash
-python pdf_crop_inner_frame.py
-Outputs:
-output_cropped/*.png → cropped inner drawing region
-debug_outputs/* → debug overlays + edges
-🔧 Tuning (very important)
-If it fails on some PDFs:
-If no lines detected
-Increase DPI:
+✅ Output Files
+For each PDF you’ll get:
+*_bbox_crop.png
+➡️ Cropped bounding box around polygon (fast + easy)
+*_masked_crop.png
+➡️ Cleanest output: template removed because everything outside polygon is black/transparent-ish
+🔧 Tuning knobs (important)
+If it picks the wrong polygon:
+Increase minimum contour size
+Change:
 Copy code
 Python
-dpi=600
-If it detects only short lines
-Reduce minLineLength:
+if area < 0.05 * page_area:
+to:
 Copy code
 Python
-minLineLength=int(0.20 * min(H, W))
-If inner border is faint
-Increase dilation:
+if area < 0.15 * page_area:
+If polygon boundary is broken
+Increase closing kernel:
 Copy code
 Python
-edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=1)
-If you want the BEST possible reliability
-The next upgrade is: ✅ detect outer border first, then search inside that ROI for the inner border
-(this avoids confusing title blocks / tables)
-If you want, I’ll give that “two-stage border detection” version too.
+kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=3)
+⭐ Best practice recommendation
+For production use: ✅ use masked_crop output
+because even if the bounding box includes some template area, the mask removes it.
+If you want, I can also modify this to output a transparent PNG (template fully removed with alpha channel).
