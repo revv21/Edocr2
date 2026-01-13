@@ -173,3 +173,263 @@ saving annotated images (view boxes + dim boxes)
 confidence filtering
 auto job_id timestamp folder
 support for PDF → image pages
+
+Yes — below is a complete runnable Python implementation of Approach 1:
+✅ Detect the inner border rectangle (drawing frame) using edges + Hough lines
+✅ Deskew (fix rotation)
+✅ Crop only the drawing area, removing the template/title block
+✅ Works even if template dimensions change (as long as there is a clear frame)
+✅ Install requirements
+Copy code
+Bash
+pip install opencv-python numpy
+✅ Script: extract_drawing_area.py
+Copy code
+Python
+import os
+import cv2
+import numpy as np
+
+
+def order_points(pts):
+    """Return points ordered as: top-left, top-right, bottom-right, bottom-left"""
+    pts = np.array(pts, dtype=np.float32)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).reshape(-1)
+
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]
+    bl = pts[np.argmax(diff)]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+
+def find_largest_rect_contour(binary_img, min_area_ratio=0.15):
+    """
+    Find the largest contour that looks like a rectangle.
+    binary_img should be white=foreground, black=background.
+    """
+    h, w = binary_img.shape[:2]
+    min_area = min_area_ratio * (h * w)
+
+    contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best = None
+    best_area = 0
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
+        # Prefer quadrilaterals
+        if len(approx) == 4:
+            if area > best_area:
+                best_area = area
+                best = approx
+
+    return best  # shape (4,1,2) or None
+
+
+def deskew_using_hough(gray):
+    """
+    Estimate skew angle using Hough lines and rotate to correct it.
+    Returns deskewed image.
+    """
+    # Edge detection
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=120,
+                            minLineLength=int(0.3 * gray.shape[1]),
+                            maxLineGap=20)
+
+    if lines is None:
+        return gray, 0.0
+
+    angles = []
+    for x1, y1, x2, y2 in lines[:, 0]:
+        dx = x2 - x1
+        dy = y2 - y1
+        if dx == 0:
+            continue
+        angle = np.degrees(np.arctan2(dy, dx))
+        # Keep near-horizontal lines only
+        if -30 < angle < 30:
+            angles.append(angle)
+
+    if len(angles) < 5:
+        return gray, 0.0
+
+    median_angle = float(np.median(angles))
+
+    h, w = gray.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), median_angle, 1.0)
+    rotated = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    return rotated, median_angle
+
+
+def extract_drawing_area(image_bgr, padding=10, debug=False):
+    """
+    Main extraction:
+    1) grayscale
+    2) deskew
+    3) detect inner frame rectangle
+    4) crop inside it
+    """
+    original = image_bgr.copy()
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Deskew (important for scanned/photographed drawings)
+    gray_deskewed, angle = deskew_using_hough(gray)
+    bgr_deskewed = cv2.cvtColor(gray_deskewed, cv2.COLOR_GRAY2BGR)
+
+    # Preprocess for border detection
+    blur = cv2.GaussianBlur(gray_deskewed, (5, 5), 0)
+
+    # Adaptive threshold makes it work on different lighting/scan conditions
+    th = cv2.adaptiveThreshold(
+        blur, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 5
+    )
+
+    # Connect border lines using morphology
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    rect = find_largest_rect_contour(closed, min_area_ratio=0.20)
+
+    if rect is None:
+        # fallback: try slightly different settings
+        kernel2 = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        closed2 = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel2, iterations=2)
+        rect = find_largest_rect_contour(closed2, min_area_ratio=0.15)
+
+        if rect is None:
+            raise RuntimeError("Could not detect inner drawing frame rectangle.")
+
+    pts = rect.reshape(4, 2)
+    pts = order_points(pts)
+
+    # Crop bounding rectangle (simpler and stable)
+    x_min = int(max(0, np.min(pts[:, 0]) + padding))
+    y_min = int(max(0, np.min(pts[:, 1]) + padding))
+    x_max = int(min(bgr_deskewed.shape[1], np.max(pts[:, 0]) - padding))
+    y_max = int(min(bgr_deskewed.shape[0], np.max(pts[:, 1]) - padding))
+
+    cropped = bgr_deskewed[y_min:y_max, x_min:x_max].copy()
+
+    debug_images = {}
+    if debug:
+        dbg = bgr_deskewed.copy()
+        cv2.polylines(dbg, [pts.astype(np.int32)], True, (0, 0, 255), 3)
+        debug_images = {
+            "gray_deskewed": gray_deskewed,
+            "threshold": th,
+            "closed": closed,
+            "detected_rect": dbg,
+            "cropped": cropped
+        }
+
+    return cropped, {
+        "deskew_angle_deg": angle,
+        "crop_box": (x_min, y_min, x_max, y_max),
+        "debug": debug_images
+    }
+
+
+def process_folder(input_dir, output_dir, debug_dir=None):
+    os.makedirs(output_dir, exist_ok=True)
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+
+    exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+    for fname in os.listdir(input_dir):
+        if not fname.lower().endswith(exts):
+            continue
+
+        in_path = os.path.join(input_dir, fname)
+        img = cv2.imread(in_path)
+
+        if img is None:
+            print(f"[WARN] Could not read: {in_path}")
+            continue
+
+        try:
+            cropped, info = extract_drawing_area(img, padding=15, debug=bool(debug_dir))
+            out_path = os.path.join(output_dir, fname)
+            cv2.imwrite(out_path, cropped)
+            print(f"[OK] {fname} -> cropped (angle={info['deskew_angle_deg']:.2f}°)")
+
+            if debug_dir:
+                base = os.path.splitext(fname)[0]
+                for k, v in info["debug"].items():
+                    if v is None:
+                        continue
+                    dbg_path = os.path.join(debug_dir, f"{base}__{k}.png")
+                    if len(v.shape) == 2:
+                        cv2.imwrite(dbg_path, v)
+                    else:
+                        cv2.imwrite(dbg_path, v)
+
+        except Exception as e:
+            print(f"[FAIL] {fname}: {e}")
+
+
+if __name__ == "__main__":
+    # Example usage:
+    # Put your input images in ./input_images/
+    # Output will go to ./output_cropped/
+    input_dir = "input_images"
+    output_dir = "output_cropped"
+    debug_dir = "debug_outputs"  # set to None to disable
+
+    process_folder(input_dir, output_dir, debug_dir=debug_dir)
+✅ How to run
+Put your drawings (images) here:
+Copy code
+
+input_images/
+  drawing1.png
+  drawing2.jpg
+Run:
+Copy code
+Bash
+python extract_drawing_area.py
+Cropped output will appear in:
+Copy code
+
+output_cropped/
+Debug visualizations will appear in:
+Copy code
+
+debug_outputs/
+Notes / tuning knobs (important)
+If your drawings vary a lot, these are the first parameters to adjust:
+1) min_area_ratio
+In find_largest_rect_contour(...)
+Increase to 0.3 if it mistakenly detects title blocks instead of full border
+Decrease to 0.1 if it fails to find a rectangle
+2) padding
+In extract_drawing_area(..., padding=15)
+Increase if border lines remain in crop.
+3) Morphology kernel sizes
+These two lines:
+Copy code
+Python
+kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+kernel2 = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+If borders are broken/faint → increase sizes.
+What this gives you (output)
+You will get an image that is basically: ✅ the main drawing region
+❌ without the outer template margins + title block tables (in most cases)
+If you want, I can also give you an improved version that:
+removes title block area only (bottom/right strip)
+handles multiple frames
+works directly on PDF → image → crop (when you run internally)
