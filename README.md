@@ -1133,3 +1133,98 @@ cli_pipeline/pipeline_cli.py
 (or paste them here)
 Then I’ll return the fully corrected final code.
 If you apply the try/except patch and still get errors, send me the next traceback screenshot and I’ll fix that too.
+Yes ✅ — that’s the right thing to do.
+Right now your JSON stores OCR per part (each crop), so you get “single character / broken tokens”.
+Instead, we’ll combine all OCR tokens from all parts of a DIM into one final string per dimension.
+✅ What we will output for each DIM
+Instead of:
+Copy code
+Json
+"parts": [
+  {"label":"dimension","ocr":"7"},
+  {"label":"dimension","ocr":"0"},
+  {"label":"tol_upper","ocr":"+"},
+  {"label":"tol_upper","ocr":"0.0"},
+  ...
+]
+We will also add:
+Copy code
+Json
+"dim_text": "70 +0.02 -0.01"
+(or whatever it reads)
+✅ How to implement (2 small edits)
+1) Add this helper function (in pipeline_cli.py)
+Put this near the top:
+Copy code
+Python
+def combine_dim_parts_text(parts):
+    """
+    Combine OCR text from all DIM parts into one string.
+    Keeps left-to-right order and removes empty junk.
+    """
+    cleaned = []
+    for p in parts:
+        t = (p.get("ocr") or "").strip()
+        if not t:
+            continue
+        cleaned.append(t)
+
+    # join and normalize spaces
+    combined = " ".join(cleaned)
+    combined = " ".join(combined.split())
+    return combined
+2) After you build parts for a DIM, add combined text
+Find this block inside your DIM section:
+Copy code
+Python
+group_rec["parts"] = parts
+Change it to:
+Copy code
+Python
+group_rec["parts"] = parts
+group_rec["dim_text"] = combine_dim_parts_text(parts)
+✅ (Optional but recommended) Combine using token boxes (more accurate)
+If you saved ocr_tokens per part, we can combine them in reading order using x-position.
+Add this instead:
+Copy code
+Python
+def combine_dim_parts_text(parts):
+    tokens_all = []
+
+    for p in parts:
+        for t in p.get("ocr_tokens", []):
+            txt = (t.get("text") or "").strip()
+            if not txt:
+                continue
+            # store global-ish ordering key
+            tokens_all.append((t["x"], t["y"], txt))
+
+    # sort by top-to-bottom then left-to-right
+    tokens_all.sort(key=lambda x: (x[1], x[0]))
+
+    combined = " ".join([t[2] for t in tokens_all])
+    combined = " ".join(combined.split())
+    return combined
+This reduces cases where it becomes "0.02 + - 70" etc.
+✅ Resulting JSON example
+Now each DIM group will contain:
+Copy code
+Json
+{
+  "label": "DIM",
+  "path": "...",
+  "parts": [...],
+  "dim_text": "70 +0.02 -0.01"
+}
+So you can directly use dim_text as the extracted dimension string.
+If you want, I can also do “smart parsing”
+Meaning: convert "70 +0.02 -0.01" into:
+Copy code
+Json
+{
+  "value": 70.0,
+  "upper_tol": 0.02,
+  "lower_tol": -0.01,
+  "symbol": "Ø"
+}
+Just say “yes parse dimension text too”.
