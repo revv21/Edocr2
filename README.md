@@ -1053,3 +1053,11 @@ Json
   "symbol": "Ø"
 }
 Just say “add DIM parsing”.
+
+python -m cli_pipeline.run_cli ^
+  --img input/drawing.jpg ^
+  --out runs_cli/job1 ^
+  --view-weights weights/0519_view_best.pt ^
+  --group-weights weights/1013_DIMandFCF_best.pt ^
+  --type-weights weights/0324_dim_and_tol_best.pt ^
+  --device cpu
