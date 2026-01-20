@@ -1061,3 +1061,75 @@ python -m cli_pipeline.run_cli ^
   --group-weights weights/1013_DIMandFCF_best.pt ^
   --type-weights weights/0324_dim_and_tol_best.pt ^
   --device cpu
+
+Got it — this error is coming from Tesseract OSD rotation detection (pytesseract.image_to_osd()), not YOLO.
+✅ What the error means
+From your screenshot:
+“Too few characters. Skipping this page”
+“Invalid resolution 0 dpi. Using 70 instead.”
+This happens when the cropped image (DIM part / datum / cell) has very little text (or is mostly blank/lines), so Tesseract cannot estimate orientation.
+So image_to_osd() crashes for small crops.
+✅ Fix (Best): Make OSD optional + fallback safely
+Edit your ocr_repo.py and update the image_preprocessing() function like this:
+✅ Replace this block:
+Copy code
+Python
+rotate_data = pytesseract.image_to_osd(pattern_image, output_type=pytesseract.Output.DICT)
+rotate = float(rotate_data.get("rotate", 0))
+image_rotated = np.rot90(image_crop, -rotate / 90)
+return image_rotated
+✅ With this SAFE version:
+Copy code
+Python
+# OSD rotation fix (pattern trick) - SAFE
+rotate = 0
+try:
+    rotate_data = pytesseract.image_to_osd(
+        pattern_image,
+        output_type=pytesseract.Output.DICT
+    )
+    rotate = float(rotate_data.get("rotate", 0))
+except pytesseract.TesseractError:
+    # too few characters / OSD fails -> skip rotation correction
+    rotate = 0
+
+image_rotated = np.rot90(image_crop, -rotate / 90)
+return image_rotated
+This will stop your pipeline from crashing and still work.
+✅ Fix (Better): Skip OSD for tiny crops
+Add this before OSD call:
+Copy code
+Python
+if image_crop.shape[0] < 25 or image_crop.shape[1] < 25:
+    return image_crop
+And also:
+Copy code
+Python
+if np.count_nonzero(image_binary) < 150:
+    return image_crop
+So OSD runs only when there is enough text.
+✅ Fix (Best for your use case): Don’t run OSD on “part crops”
+OSD is great for full DIM crop, but for tiny parts like tolerance blocks it often fails.
+So modify your OCR call:
+For DIM PART crops use only deskew + crop (skip OSD)
+We can add a flag:
+Copy code
+Python
+def ocr_text(img, use_osd=True, ...):
+and call:
+use_osd=False for tiny crops
+use_osd=True for full DIM / FCF frame
+If you want, I’ll write that version too.
+✅ Quick test after patch
+Run again:
+Copy code
+Bash
+python -m cli_pipeline.run_cli --img input/drawing.jpg --out runs_cli/job1 ...
+It should no longer crash.
+⚠️ One more thing: some of your earlier uploaded files expired
+If you want me to patch your exact pipeline files directly (instead of you editing), please re-upload the current versions of:
+cli_pipeline/ocr_repo.py
+cli_pipeline/pipeline_cli.py
+(or paste them here)
+Then I’ll return the fully corrected final code.
+If you apply the try/except patch and still get errors, send me the next traceback screenshot and I’ll fix that too.
