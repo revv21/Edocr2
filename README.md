@@ -820,3 +820,236 @@ If your FCF cell detection still misses boxes, I can: ✅ add line-thickness nor
 ✅ merge nearby intersection clusters better
 ✅ enforce row/column sorting (so cells are ordered correctly)
 Just share one cropped FCF_00.jpg and I’ll tune it perfectly.
+
+
+
+
+Perfect — thanks. This OCR file is much better than the simple OCR we used because it does 2-stage rotation correction:
+deskew using minAreaRect()
+OSD rotation detection using a tiled “pattern image” and image_to_osd()
+That’s exactly why their repo performs better on rotated dimensions.
+Now I’ll integrate this OCR exactly into the Option-A pipeline (DIM + FCF + Datum).
+✅ What we will use from your OCR file
+Functions:
+image_preprocessing(img) → returns rotated + cropped clean image
+recg_text(img, lang='eng', config="--oem 3 --psm 4") → returns word boxes + text
+We’ll add a helper to convert recg_text() output into a single string.
+✅ Drop-in OCR module for pipeline
+Create this file:
+cli_pipeline/ocr_repo.py
+Copy code
+Python
+import cv2
+import numpy as np
+import pytesseract
+
+
+def getProjection(image):
+    (h, w) = image.shape
+    start = 0
+    end = 0
+    isFirst = True
+
+    for i in range(h):
+        arr = image[i]
+        if ~(np.any(arr)):
+            continue
+
+        if isFirst:
+            start = i - 1
+            isFirst = False
+        else:
+            end = i + 1
+
+    return start, end
+
+
+def image_preprocessing(original_image):
+    h, w = original_image.shape[:2]
+
+    side_length = int(max(h, w) * 1.3)
+    blank_image = np.zeros((side_length, side_length, 3), np.uint8)
+    blank_image[:, :] = (255, 255, 255)
+
+    border_y, border_x = int((side_length - h) / 2), int((side_length - w) / 2)
+    blank_image[border_y:border_y + h, border_x:border_x + w] = original_image
+    image = blank_image.copy()
+
+    # grayscale
+    image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # invert so text becomes white
+    image_gray = cv2.bitwise_not(image_gray)
+    image_blur = cv2.GaussianBlur(image_gray, (7, 7), 0)
+
+    # binarize
+    _, thresh = cv2.threshold(image_blur, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+    whereid = np.where(thresh > 0)
+    whereid = whereid[::-1]
+    coords = np.column_stack(whereid)
+
+    if len(coords) < 10:
+        return original_image
+
+    (x, y), (w, h), angle = cv2.minAreaRect(coords)
+    if angle < -45:
+        angle = 90 - angle
+
+    # rotate to deskew
+    center = (side_length // 2, side_length // 2)
+    Mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+    rotated = cv2.warpAffine(
+        image, Mat, (side_length, side_length),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+    # crop by projection
+    image_gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
+    _, image_binary = cv2.threshold(image_gray, 127, 255, cv2.THRESH_BINARY_INV)
+
+    H_start, H_end = getProjection(image_binary)
+    W_start, W_end = getProjection(image_binary.T)
+
+    border = round(side_length * 0.05)
+
+    # clamp crop
+    y1 = max(0, H_start - border)
+    y2 = min(rotated.shape[0], H_end + border)
+    x1 = max(0, W_start - border)
+    x2 = min(rotated.shape[1], W_end + border)
+
+    image_crop = rotated[y1:y2, x1:x2]
+
+    # OSD rotation fix (pattern trick)
+    (h, w, d) = image_crop.shape
+    num = 10
+    pattern_image = np.zeros((h * num, w * num, 3), np.uint8)
+
+    for i in range(num):
+        for j in range(num):
+            pattern_image[h * i:h * (i + 1), w * j:w * (j + 1)] = image_crop
+
+    rotate_data = pytesseract.image_to_osd(pattern_image, output_type=pytesseract.Output.DICT)
+    rotate = float(rotate_data.get("rotate", 0))
+
+    image_rotated = np.rot90(image_crop, -rotate / 90)
+    return image_rotated
+
+
+def recg_text(original_image, lang="eng", config="--oem 3 --psm 4"):
+    datas = pytesseract.image_to_data(
+        original_image,
+        lang=lang,
+        config=config,
+        output_type=pytesseract.Output.DICT
+    )
+
+    result = []
+    for i in range(len(datas["text"])):
+        try:
+            conf = float(datas["conf"][i])
+        except:
+            conf = -1
+
+        if conf > 10:
+            res = {
+                "x": int(datas["left"][i]),
+                "y": int(datas["top"][i]),
+                "w": int(datas["width"][i]),
+                "h": int(datas["height"][i]),
+                "text": datas["text"][i].strip()
+            }
+            if res["text"]:
+                result.append(res)
+
+    return result
+
+
+def ocr_text(img, lang="eng", config="--oem 3 --psm 4"):
+    """
+    Convenience function:
+    preprocess -> recg_text -> join tokens
+    """
+    pre = image_preprocessing(img)
+    tokens = recg_text(pre, lang=lang, config=config)
+    text = " ".join([t["text"] for t in tokens if t["text"]])
+    return text, tokens, pre
+✅ Update DIM / FCF / Datum extractors to use repo OCR
+1) DIM OCR update
+In your cli_pipeline/pipeline_cli.py (DIM parts OCR), replace:
+Copy code
+Python
+text = ocr_best(p_crop)
+with:
+Copy code
+Python
+from cli_pipeline.ocr_repo import ocr_text
+text, tokens, pre = ocr_text(p_crop, lang="eng", config="--oem 3 --psm 6")
+And store tokens too:
+Copy code
+Python
+parts.append({
+    ...
+    "ocr": text,
+    "ocr_tokens": tokens
+})
+2) FCF extractor update
+In fcf_extractor.py, replace OCR call:
+Copy code
+Python
+text = ocr_best(cell_crop)
+with:
+Copy code
+Python
+from cli_pipeline.ocr_repo import ocr_text
+text, tokens, pre = ocr_text(cell_crop, lang="eng", config="--oem 3 --psm 6")
+3) Datum extractor update
+In datum_extractor.py, replace:
+Copy code
+Python
+text = ocr_best(clean)
+with:
+Copy code
+Python
+from cli_pipeline.ocr_repo import ocr_text
+text, tokens, pre = ocr_text(clean, lang="eng", config="--oem 3 --psm 10")
+(psm 10 is good for single characters)
+✅ Why this fixes your “rotated OCR is bad” issue
+Because this OCR method does:
+✔ Deskew using minAreaRect
+Fixes tilted/slanted text.
+✔ Projection crop
+Removes extra borders and empty space.
+✔ OSD rotation correction
+Fixes 90/180/270 degree rotations reliably.
+This is exactly what you need for rotated DIM values and tolerance blocks.
+⚠️ One more thing (super important)
+Your OCR uses image_to_osd() which needs enough text pixels. For very tiny crops, it can fail or mis-detect rotation.
+So best practice: ✅ Run repo OCR on:
+DIM crop (bigger)
+FCF crop (bigger)
+Datum crop (medium)
+and on DIM parts only if they’re not too tiny
+If you want, I can add a rule like:
+Copy code
+Python
+if crop_area < 1200: skip OSD step
+to make it even more stable.
+✅ Final result
+After this change, your pipeline will produce:
+more accurate OCR on rotated text
+closer match to repo/paper outputs
+consistent token-level OCR output (so you can postprocess)
+If you want, next I’ll also add DIM reconstruction logic (combine detected parts into a final dimension object like):
+Copy code
+Json
+{
+  "value": "70.5",
+  "upper": "+0.02",
+  "lower": "-0.01",
+  "symbol": "Ø"
+}
+Just say “add DIM parsing”.
