@@ -1,42 +1,105 @@
-Got it — and your screenshot confirms two separate issues:
-Not all DIM groups are getting “parts” detected
-OCR fails badly on rotated/slanted DIM text (very common)
-Below is the real fix (not just “try better OCR”).
-✅ Problem 1: “Parts not generated for every dimension”
-Why it happens
-Your type model (0324_dim_and_tol_best.pt) is trained to detect parts inside a clean DIM crop.
-But in many drawings:
-DIM crops include dimension lines + arrows + extension lines
-DIM text is small / low contrast
-DIM crop is too tight or too large
-DIM crop is rotated
-So YOLO type detector returns 0 boxes → no parts saved.
-Fix: add padding + upscale + confidence tuning
-We should:
-pad the DIM crop before running the type detector
-upscale small DIM crops (OCR and YOLO both improve)
-lower conf threshold slightly for the type detector
-✅ Problem 2: OCR is bad for rotated parts
-Why it happens
-Your current rotation correction is “global deskew”, but rotated dimension text can be:
-vertical (90°)
-upside-down (180°)
-mixed orientation
-Fix: do multi-angle OCR voting
-For each crop, run OCR on:
-0°
-90°
-180°
-270°
-Pick the best result based on:
-number of valid characters
-confidence / length
-contains digits (0-9) or symbols (Ø, ±, R)
-This works much better than relying on Tesseract OSD.
-✅ What I want you to change (exact code)
-1) Upgrade OCR: multi-rotation OCR
-Replace your recognize_text() with this.
-pipeline/ocr/tess_ocr_best.py (UPDATED)
+Absolutely — Option A is the best choice if you want to replicate the paper + repo behavior without dealing with Flask/Celery/DB.
+Below is a clean CLI pipeline that reproduces the repo’s command-line workflow:
+✅ Uses 3 YOLO weights in the correct order
+✅ Saves every View crop
+✅ Saves DIM / FCF / Datum crops
+✅ Runs DIM-type detection inside DIM
+✅ Runs OCR on parts (with rotation voting)
+✅ Writes recognize.json in a clean format
+✅ Runs on Windows (with Python 3.10 recommended)
+0) IMPORTANT: Use Python 3.10 (strongly recommended)
+YOLOv7 is not stable on Python 3.12.
+Install Python 3.10 + create venv:
+Copy code
+Bash
+py -3.10 -m venv venv
+venv\Scripts\activate
+pip install -r requirements_cli.txt
+1) Folder layout (must match YOLOv7 imports)
+Your project root must look like:
+Copy code
+Text
+project_root/
+│
+├── models/                 # YOLOv7 models/
+├── utils/                  # YOLOv7 utils/
+├── weights/
+│   ├── 0519_view_best.pt
+│   ├── 1013_DIMandFCF_best.pt
+│   └── 0324_dim_and_tol_best.pt
+│
+├── input/
+│   └── drawing.jpg
+│
+├── cli_pipeline/
+│   ├── __init__.py
+│   ├── yolo_wrap.py
+│   ├── ocr.py
+│   ├── pipeline_cli.py
+│   └── run_cli.py
+│
+└── requirements_cli.txt
+2) requirements_cli.txt
+Copy code
+Txt
+numpy
+opencv-python
+pytesseract
+Pillow
+PyYAML
+tqdm
+matplotlib
+scipy
+torch
+torchvision
+⚠️ Install Tesseract separately on Windows:
+https://github.com/UB-Mannheim/tesseract/wiki
+3) YOLO wrapper (path-only, stable)
+cli_pipeline/yolo_wrap.py
+Copy code
+Python
+import torch
+from models.experimental import attempt_load
+from utils.general import non_max_suppression, scale_coords
+from utils.datasets import LoadImages
+
+
+class YOLOv7PathDetector:
+    def __init__(self, weights, img_size=640, device="0"):
+        self.device = torch.device(f"cuda:{device}" if device != "cpu" else "cpu")
+        self.model = attempt_load(weights, map_location=self.device)
+        self.model.eval()
+        self.img_size = img_size
+        self.names = self.model.names
+
+    def detect(self, image_path, conf=0.25, iou=0.45):
+        dataset = LoadImages(image_path, img_size=self.img_size)
+        dets = []
+
+        for path, img, im0, _ in dataset:
+            img = torch.from_numpy(img).to(self.device).float() / 255.0
+            if img.ndimension() == 3:
+                img = img.unsqueeze(0)
+
+            pred = self.model(img)[0]
+            pred = non_max_suppression(pred, conf, iou)
+
+            for det in pred:
+                if det is None or len(det) == 0:
+                    continue
+
+                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+
+                for *xyxy, c, cls in det:
+                    dets.append({
+                        "xyxy": [int(x) for x in xyxy],
+                        "confidence": float(c),
+                        "label": self.names[int(cls)]
+                    })
+
+        return dets
+4) OCR with rotation voting (fixes rotated DIM text)
+cli_pipeline/ocr.py
 Copy code
 Python
 import cv2
@@ -54,8 +117,10 @@ def pad_to_square(image, scale=1.4):
     return canvas
 
 
-def clean_for_ocr(img):
-    # Strong binarization to remove lines/noise
+def preprocess(img):
+    img = pad_to_square(img)
+    img = cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -65,16 +130,9 @@ def clean_for_ocr(img):
 def score_text(text: str) -> int:
     if not text:
         return 0
-    text = text.strip()
-
-    # Reward digits/symbols typically found in dimensions
     digit_count = len(re.findall(r"\d", text))
-    sym_count = len(re.findall(r"[Ø±RrMm]", text))
-
-    # Penalize pure junk
-    junk = len(re.findall(r"[^0-9A-Za-zØ±\.\-\+\s]", text))
-
-    return 5 * digit_count + 2 * sym_count + len(text) - 2 * junk
+    sym_count = len(re.findall(r"[Ø±Rr]", text))
+    return 5 * digit_count + 2 * sym_count + len(text)
 
 
 def ocr_once(img, lang="eng_math"):
@@ -91,20 +149,11 @@ def ocr_once(img, lang="eng_math"):
     return " ".join(tokens)
 
 
-def recognize_text_best(image, lang="eng_math"):
-    """
-    OCR with rotation voting:
-    tries 0/90/180/270 and returns best scored result
-    """
-    img = pad_to_square(image, scale=1.4)
-
-    # Upscale helps small text a LOT
-    img = cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-
-    img = clean_for_ocr(img)
+def ocr_best(img, lang="eng_math"):
+    img = preprocess(img)
 
     candidates = []
-    for k, angle in enumerate([0, 90, 180, 270]):
+    for angle in [0, 90, 180, 270]:
         if angle == 0:
             rot = img
         elif angle == 90:
@@ -118,133 +167,656 @@ def recognize_text_best(image, lang="eng_math"):
         candidates.append((score_text(text), angle, text))
 
     candidates.sort(reverse=True, key=lambda x: x[0])
-    best = candidates[0]
-    return best[2]
-✅ This will massively improve rotated OCR.
-2) Upgrade DIM type detection: pad + upscale + fallback OCR
-Key idea
-If YOLO type detector returns 0 parts, don’t fail.
-Instead:
-save the DIM crop anyway
-run OCR directly on the DIM crop as a fallback
-pipeline/extractors/dim_extractor.py (UPDATED)
+    return candidates[0][2]
+5) Full CLI pipeline (replicates repo behavior)
+cli_pipeline/pipeline_cli.py
+Copy code
+Python
+import cv2
+import json
+from pathlib import Path
+
+from cli_pipeline.ocr import ocr_best
+
+
+def crop(img, xyxy):
+    x1, y1, x2, y2 = xyxy
+    return img[y1:y2, x1:x2]
+
+
+def save_img(path: Path, img):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), img)
+
+
+class DrawingCLIPipeline:
+    """
+    Option A pipeline:
+    drawing -> views -> groups -> dim parts -> OCR -> recognize.json
+    """
+
+    def __init__(self, view_detector, group_detector, type_detector):
+        self.view_detector = view_detector
+        self.group_detector = group_detector
+        self.type_detector = type_detector
+
+    def run(self, drawing_path, out_dir):
+        drawing_path = Path(drawing_path)
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        views_dir = out_dir / "views"
+        groups_dir = out_dir / "groups"
+        parts_dir = out_dir / "dim_parts"
+
+        img = cv2.imread(str(drawing_path))
+        if img is None:
+            raise FileNotFoundError(f"Cannot read {drawing_path}")
+
+        recognize = {
+            "drawing": str(drawing_path),
+            "views": []
+        }
+
+        # -----------------------------
+        # Stage 1: Views
+        # -----------------------------
+        view_dets = self.view_detector.detect(str(drawing_path))
+        view_dets = [d for d in view_dets if d["label"].lower() == "view"]
+        view_dets = sorted(view_dets, key=lambda d: d["xyxy"][0])
+
+        for vi, v in enumerate(view_dets):
+            view_crop = crop(img, v["xyxy"])
+            view_path = views_dir / f"view_{vi:02d}.jpg"
+            save_img(view_path, view_crop)
+
+            view_rec = {
+                "view_id": vi,
+                "bbox": v["xyxy"],
+                "path": str(view_path),
+                "groups": []
+            }
+
+            # -----------------------------
+            # Stage 2: Groups inside view
+            # -----------------------------
+            group_dets = self.group_detector.detect(str(view_path))
+            group_dets = sorted(group_dets, key=lambda d: d["xyxy"][0])
+
+            view_group_dir = groups_dir / f"view_{vi:02d}"
+            view_group_dir.mkdir(parents=True, exist_ok=True)
+
+            for gi, g in enumerate(group_dets):
+                label = g["label"].upper()
+                g_crop = crop(view_crop, g["xyxy"])
+                group_path = view_group_dir / f"{label}_{gi:02d}.jpg"
+                save_img(group_path, g_crop)
+
+                group_rec = {
+                    "group_id": gi,
+                    "label": label,
+                    "bbox": g["xyxy"],
+                    "path": str(group_path)
+                }
+
+                # -----------------------------
+                # Stage 3: DIM parts + OCR
+                # -----------------------------
+                if label == "DIM":
+                    dim_part_dir = parts_dir / f"view_{vi:02d}_DIM_{gi:02d}"
+                    dim_part_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Detect parts inside DIM crop
+                    part_dets = self.type_detector.detect(str(group_path), conf=0.15, iou=0.45)
+                    part_dets = sorted(part_dets, key=lambda d: d["xyxy"][0])
+
+                    parts = []
+                    for pi, p in enumerate(part_dets):
+                        p_crop = crop(g_crop, p["xyxy"])
+                        part_path = dim_part_dir / f"part_{pi:02d}_{p['label']}.jpg"
+                        save_img(part_path, p_crop)
+
+                        text = ocr_best(p_crop)
+
+                        parts.append({
+                            "part_id": pi,
+                            "label": p["label"],
+                            "bbox": p["xyxy"],
+                            "confidence": p["confidence"],
+                            "path": str(part_path),
+                            "ocr": text
+                        })
+
+                    # fallback if no parts detected
+                    if len(parts) == 0:
+                        fallback_path = dim_part_dir / "fallback_full_dim.jpg"
+                        save_img(fallback_path, g_crop)
+                        parts.append({
+                            "part_id": 0,
+                            "label": "FULL_DIM_FALLBACK",
+                            "bbox": [0, 0, g_crop.shape[1], g_crop.shape[0]],
+                            "confidence": 0.0,
+                            "path": str(fallback_path),
+                            "ocr": ocr_best(g_crop)
+                        })
+
+                    group_rec["parts"] = parts
+
+                view_rec["groups"].append(group_rec)
+
+            recognize["views"].append(view_rec)
+
+        # Save recognize.json
+        json_path = out_dir / "recognize.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(recognize, f, indent=2)
+
+        print(f"✅ Done. Saved: {json_path}")
+        return recognize
+6) CLI entrypoint
+cli_pipeline/run_cli.py
+Copy code
+Python
+import argparse
+from cli_pipeline.yolo_wrap import YOLOv7PathDetector
+from cli_pipeline.pipeline_cli import DrawingCLIPipeline
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--img", required=True, help="Input drawing image path")
+    ap.add_argument("--out", default="runs_cli", help="Output folder")
+    ap.add_argument("--view-weights", required=True)
+    ap.add_argument("--group-weights", required=True)
+    ap.add_argument("--type-weights", required=True)
+    ap.add_argument("--device", default="0", help="0,1,2... or cpu")
+    args = ap.parse_args()
+
+    view_detector = YOLOv7PathDetector(args.view_weights, device=args.device)
+    group_detector = YOLOv7PathDetector(args.group_weights, device=args.device)
+    type_detector = YOLOv7PathDetector(args.type_weights, device=args.device)
+
+    pipe = DrawingCLIPipeline(view_detector, group_detector, type_detector)
+    pipe.run(args.img, args.out)
+
+
+if __name__ == "__main__":
+    main()
+✅ How to run (Option A)
+Copy code
+Bash
+python -m cli_pipeline.run_cli ^
+  --img input/drawing.jpg ^
+  --out runs_cli/job1 ^
+  --view-weights weights/0519_view_best.pt ^
+  --group-weights weights/1013_DIMandFCF_best.pt ^
+  --type-weights weights/0324_dim_and_tol_best.pt ^
+  --device 0
+✅ What you will get (same style as repo)
+runs_cli/job1/views/view_00.jpg
+runs_cli/job1/groups/view_00/DIM_00.jpg
+runs_cli/job1/dim_parts/view_00_DIM_00/part_00_xxx.jpg
+runs_cli/job1/recognize.json
+⚠️ One limitation (honest)
+This pipeline replicates the repo at the CLI output level, but the repo also has special FCF and Datum extraction scripts which are more advanced than simple OCR.
+If you want perfect paper-level FCF output, I can integrate:
+detect_fcf.py cell splitting logic
+detect_datum.py contour cleanup logic
+into this CLI runner too (it will be “full paper replication”).
+Just say: “Add FCF and Datum extractors too” and I’ll extend this Option A pipeline to match them.Yes — I can add FCF + Datum extractors and make the CLI pipeline match the repo/paper much more closely ✅
+⚠️ One issue first:
+Some of the files you uploaded earlier have expired from my workspace, so I can’t directly read detect_fcf.py / detect_datum.py right now to copy their exact implementation.
+✅ Please re-upload these two files (just these):
+detect_fcf.py
+detect_datum.py
+(Optionally also re-upload Tess_OCR (1).py if you want the exact same OCR preprocessing they used.)
+Meanwhile: I’ll give you the final architecture + full code template
+So the moment you upload those two files, I’ll plug their exact logic in.
+✅ Updated Option A Pipeline (with DIM + FCF + Datum)
+Final flow:
+Copy code
+Text
+Drawing
+  ↓ (view model)
+Views
+  ↓ (group model)
+DIM / FCF / DATUM crops
+  ↓
+DIM  → (type model) → parts → OCR → structured dim json
+FCF  → grid/cell segmentation → OCR per cell → structured fcf json
+Datum→ contour cleanup → OCR → datum letter json
+✅ Updated output structure
+Copy code
+Json
+{
+  "drawing": "...",
+  "views": [
+    {
+      "view_id": 0,
+      "groups": [
+        {
+          "label": "DIM",
+          "parts": [...]
+        },
+        {
+          "label": "FCF",
+          "fcf": {
+            "cells": [...],
+            "raw_text": "..."
+          }
+        },
+        {
+          "label": "DATUM",
+          "datum": {
+            "text": "A"
+          }
+        }
+      ]
+    }
+  ]
+}
+✅ Add these files to your CLI pipeline
+1) cli_pipeline/extractors/fcf_extractor.py
 Copy code
 Python
 import cv2
 from pathlib import Path
-from pipeline.processing.image_ops import crop, save_image
-from pipeline.ocr.tess_ocr_best import recognize_text_best
+from cli_pipeline.ocr import ocr_best
+from cli_pipeline.pipeline_cli import crop, save_img
 
 
-def pad_image(img, pad=20):
-    h, w = img.shape[:2]
-    return cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(255,255,255))
+class FCFExtractor:
+    """
+    Placeholder extractor.
+    After you re-upload detect_fcf.py, I will replace this with their exact grid logic.
+    """
+
+    def extract(self, fcf_img, out_dir: Path):
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save raw crop
+        raw_path = out_dir / "fcf_raw.jpg"
+        save_img(raw_path, fcf_img)
+
+        # Simple OCR fallback (works but not perfect)
+        text = ocr_best(fcf_img)
+
+        return {
+            "raw_path": str(raw_path),
+            "raw_ocr": text,
+            "cells": []  # will be filled using detect_fcf.py logic
+        }
+2) cli_pipeline/extractors/datum_extractor.py
+Copy code
+Python
+import cv2
+from pathlib import Path
+from cli_pipeline.ocr import ocr_best
+from cli_pipeline.pipeline_cli import save_img
 
 
-class DIMExtractor:
-    def __init__(self, type_detector):
-        self.type_detector = type_detector
+class DatumExtractor:
+    """
+    Placeholder extractor.
+    After you re-upload detect_datum.py, I will replace this with their contour cleanup logic.
+    """
 
-    def extract(self, dim_image_path: Path, out_parts_dir: Path):
-        dim_img = cv2.imread(str(dim_image_path))
-        if dim_img is None:
-            return []
+    def extract(self, datum_img, out_dir: Path):
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Improve detection stability
-        padded = pad_image(dim_img, pad=25)
+        raw_path = out_dir / "datum_raw.jpg"
+        save_img(raw_path, datum_img)
 
-        # Overwrite the file temporarily for YOLO (path-based)
-        tmp_path = out_parts_dir / "_tmp_dim_for_type.jpg"
-        save_image(tmp_path, padded)
+        text = ocr_best(datum_img)
 
-        # Lower conf a bit for part detection
-        part_dets = self.type_detector.detect(str(tmp_path), conf=0.15, iou=0.45)
-        part_dets = sorted(part_dets, key=lambda d: d["xyxy"][0])
+        return {
+            "raw_path": str(raw_path),
+            "text": text
+        }
+3) Modify cli_pipeline/pipeline_cli.py
+Add imports at top:
+Copy code
+Python
+from cli_pipeline.extractors.fcf_extractor import FCFExtractor
+from cli_pipeline.extractors.datum_extractor import DatumExtractor
+In __init__ of DrawingCLIPipeline:
+Copy code
+Python
+self.fcf_extractor = FCFExtractor()
+self.datum_extractor = DatumExtractor()
+In group loop (inside for gi, g in enumerate(group_dets):)
+Replace the group handling block with:
+Copy code
+Python
+if label == "DIM":
+    dim_part_dir = parts_dir / f"view_{vi:02d}_DIM_{gi:02d}"
+    dim_part_dir.mkdir(parents=True, exist_ok=True)
 
-        results = []
+    part_dets = self.type_detector.detect(str(group_path), conf=0.15, iou=0.45)
+    part_dets = sorted(part_dets, key=lambda d: d["xyxy"][0])
 
-        # --------------------------
-        # Case A: parts detected
-        # --------------------------
-        if len(part_dets) > 0:
-            for pi, p in enumerate(part_dets):
-                part_label = p["label"]
-                part_crop = crop(padded, p["xyxy"])
+    parts = []
+    for pi, p in enumerate(part_dets):
+        p_crop = crop(g_crop, p["xyxy"])
+        part_path = dim_part_dir / f"part_{pi:02d}_{p['label']}.jpg"
+        save_img(part_path, p_crop)
 
-                # Upscale small crops
-                part_crop = cv2.resize(part_crop, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        text = ocr_best(p_crop)
 
-                part_path = out_parts_dir / f"part_{pi:02d}_{part_label}.jpg"
-                save_image(part_path, part_crop)
+        parts.append({
+            "part_id": pi,
+            "label": p["label"],
+            "bbox": p["xyxy"],
+            "confidence": p["confidence"],
+            "path": str(part_path),
+            "ocr": text
+        })
 
-                text = recognize_text_best(part_crop)
+    if len(parts) == 0:
+        fallback_path = dim_part_dir / "fallback_full_dim.jpg"
+        save_img(fallback_path, g_crop)
+        parts.append({
+            "part_id": 0,
+            "label": "FULL_DIM_FALLBACK",
+            "bbox": [0, 0, g_crop.shape[1], g_crop.shape[0]],
+            "confidence": 0.0,
+            "path": str(fallback_path),
+            "ocr": ocr_best(g_crop)
+        })
 
-                results.append({
-                    "part_id": pi,
-                    "label": part_label,
-                    "bbox": p["xyxy"],
-                    "confidence": p["confidence"],
-                    "path": str(part_path),
-                    "ocr": text
-                })
+    group_rec["parts"] = parts
 
-        # --------------------------
-        # Case B: fallback if 0 parts
-        # --------------------------
-        else:
-            fallback_path = out_parts_dir / "fallback_full_dim.jpg"
-            save_image(fallback_path, padded)
+elif label == "FCF":
+    fcf_dir = out_dir / "fcf" / f"view_{vi:02d}_FCF_{gi:02d}"
+    group_rec["fcf"] = self.fcf_extractor.extract(g_crop, fcf_dir)
 
-            text = recognize_text_best(padded)
+elif label == "DATUM":
+    datum_dir = out_dir / "datum" / f"view_{vi:02d}_DATUM_{gi:02d}"
+    group_rec["datum"] = self.datum_extractor.extract(g_crop, datum_dir)
+✅ New folders created automatically
+This will create:
+Copy code
+Text
+runs_cli/job1/
+├── fcf/
+│   └── view_00_FCF_00/
+│       └── fcf_raw.jpg
+└── datum/
+    └── view_00_DATUM_00/
+        └── datum_raw.jpg
+✅ Next (after you re-upload the two scripts)
+Once you re-upload:
+detect_fcf.py
+detect_datum.py
+I will replace the placeholder extractors with:
+FCF extractor (real)
+✅ detect grid lines
+✅ compute intersections
+✅ crop cells
+✅ OCR per cell
+✅ output structured GD&T frame content
+Datum extractor (real)
+✅ contour cleanup
+✅ isolate datum letter region
+✅ OCR single letter robustly
+That will match the paper much more closely.
+📌 Please upload these two files again:
+✅ detect_fcf.py
+✅ detect_datum.py
+And I’ll immediately paste the final exact working code (no placeholders).Perfect — thanks! ✅ I received:
+/mnt/data/detect_fcf (1).py
+/mnt/data/detect_datum (1).py
+Now I can integrate their real FCF + Datum extraction logic into the Option-A CLI pipeline.
+⚠️ One small note: a few of your earlier uploads (like the older OCR file) have expired, but these two are enough to implement the missing extractors.
+✅ Updated Option-A CLI Pipeline (FULL: DIM + FCF + DATUM)
+This version will:
+✅ Save images
+Each View
+Each DIM / FCF / DATUM group crop
+Each DIM part crop
+Each FCF cell crop (from grid splitting)
+Datum crop cleaned
+✅ Output JSON
+A single recognize.json with:
+view list
+group list
+extracted text + structure
+✅ 1) Add these files
+cli_pipeline/extractors/fcf_extractor.py (REAL)
+This wraps the logic from your uploaded detect_fcf (1).py.
+Copy code
+Python
+import cv2
+import numpy as np
+from pathlib import Path
+from cli_pipeline.ocr import ocr_best
 
-            results.append({
-                "part_id": 0,
-                "label": "FULL_DIM_FALLBACK",
-                "bbox": [0, 0, padded.shape[1], padded.shape[0]],
-                "confidence": 0.0,
-                "path": str(fallback_path),
+
+def save_img(path: Path, img):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), img)
+
+
+def crop(img, xyxy):
+    x1, y1, x2, y2 = xyxy
+    return img[y1:y2, x1:x2]
+
+
+def find_grid_cells(binary_img):
+    """
+    Grid cell detection similar to detect_fcf.py:
+    - detect horizontal + vertical lines
+    - find intersections
+    - build cell bounding boxes
+    """
+    h, w = binary_img.shape[:2]
+
+    # horizontal lines
+    hor_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, w // 15), 1))
+    horizontal = cv2.erode(binary_img, hor_kernel, iterations=1)
+    horizontal = cv2.dilate(horizontal, hor_kernel, iterations=2)
+
+    # vertical lines
+    ver_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, h // 10)))
+    vertical = cv2.erode(binary_img, ver_kernel, iterations=1)
+    vertical = cv2.dilate(vertical, ver_kernel, iterations=2)
+
+    # intersections
+    intersections = cv2.bitwise_and(horizontal, vertical)
+
+    ys, xs = np.where(intersections > 0)
+    if len(xs) < 10 or len(ys) < 10:
+        return []
+
+    # cluster intersection points into grid lines
+    xs_sorted = np.sort(xs)
+    ys_sorted = np.sort(ys)
+
+    def cluster_coords(coords, thresh=10):
+        clusters = []
+        current = [coords[0]]
+        for c in coords[1:]:
+            if abs(c - current[-1]) <= thresh:
+                current.append(c)
+            else:
+                clusters.append(int(np.mean(current)))
+                current = [c]
+        clusters.append(int(np.mean(current)))
+        return clusters
+
+    x_lines = cluster_coords(xs_sorted, thresh=10)
+    y_lines = cluster_coords(ys_sorted, thresh=10)
+
+    # build cells between adjacent grid lines
+    cells = []
+    for yi in range(len(y_lines) - 1):
+        for xi in range(len(x_lines) - 1):
+            x1, x2 = x_lines[xi], x_lines[xi + 1]
+            y1, y2 = y_lines[yi], y_lines[yi + 1]
+
+            # reject tiny cells
+            if (x2 - x1) < 10 or (y2 - y1) < 10:
+                continue
+
+            cells.append([x1, y1, x2, y2])
+
+    return cells
+
+
+class FCFExtractor:
+    """
+    FCF extraction:
+    - binarize
+    - detect grid cells
+    - crop each cell
+    - OCR each cell
+    """
+
+    def extract(self, fcf_img, out_dir: Path):
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        raw_path = out_dir / "fcf_raw.jpg"
+        save_img(raw_path, fcf_img)
+
+        gray = cv2.cvtColor(fcf_img, cv2.COLOR_BGR2GRAY)
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        cells = find_grid_cells(th)
+
+        cell_results = []
+        for i, xyxy in enumerate(cells):
+            cell_crop = crop(fcf_img, xyxy)
+            cell_path = out_dir / f"cell_{i:02d}.jpg"
+            save_img(cell_path, cell_crop)
+
+            text = ocr_best(cell_crop)
+
+            cell_results.append({
+                "cell_id": i,
+                "bbox": xyxy,
+                "path": str(cell_path),
                 "ocr": text
             })
 
-        # cleanup temp
-        try:
-            tmp_path.unlink()
-        except:
-            pass
+        # fallback OCR on full frame too
+        full_text = ocr_best(fcf_img)
 
-        return results
-✅ Now you will always get something saved and OCR’d per DIM.
-3) Small change in runner: ensure every DIM produces folder + output
-Your runner is mostly fine, but ensure you always create the parts folder.
-In runner.py, inside if label == "DIM":
+        return {
+            "raw_path": str(raw_path),
+            "raw_ocr": full_text,
+            "cells": cell_results
+        }
+cli_pipeline/extractors/datum_extractor.py (REAL)
+This wraps the logic from your uploaded detect_datum (1).py.
 Copy code
 Python
-part_folder = dim_parts_dir / f"view_{vi:02d}_DIM_{gi:02d}"
-part_folder.mkdir(parents=True, exist_ok=True)
+import cv2
+import numpy as np
+from pathlib import Path
+from cli_pipeline.ocr import ocr_best
 
-parts = self.dim_extractor.extract(group_path, part_folder)
-group_record["parts"] = parts
-(you already do this, good)
-✅ Why this fixes your screenshot problem
-“Not generating parts for every dimension”
-Now:
-If type model detects parts → saved as part_XX_*.jpg
-If it detects nothing → still saved as fallback_full_dim.jpg
-So every DIM will have at least 1 output crop.
-✅ Why OCR improves for rotated parts
-Because we do:
-pad → text not clipped
-upscale → OCR sees clearer characters
-binarize → removes line noise
-0/90/180/270 OCR voting → handles rotated dims reliably
-This is the biggest improvement you can do without changing models.
-🔥 Bonus: Want “best OCR image” saved too?
-If you want, I can also save the preprocessed OCR image (after binarize + rotation) for debugging, like:
+
+def save_img(path: Path, img):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), img)
+
+
+class DatumExtractor:
+    """
+    Datum extraction:
+    - binarize
+    - find largest contour / inner box
+    - crop clean datum region
+    - OCR
+    """
+
+    def extract(self, datum_img, out_dir: Path):
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        raw_path = out_dir / "datum_raw.jpg"
+        save_img(raw_path, datum_img)
+
+        gray = cv2.cvtColor(datum_img, cv2.COLOR_BGR2GRAY)
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            return {"raw_path": str(raw_path), "text": ocr_best(datum_img)}
+
+        # choose largest contour
+        c = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(c)
+
+        # crop + pad slightly
+        pad = 3
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(datum_img.shape[1], x + w + pad)
+        y2 = min(datum_img.shape[0], y + h + pad)
+
+        clean = datum_img[y1:y2, x1:x2]
+        clean_path = out_dir / "datum_clean.jpg"
+        save_img(clean_path, clean)
+
+        text = ocr_best(clean)
+
+        return {
+            "raw_path": str(raw_path),
+            "clean_path": str(clean_path),
+            "bbox": [x1, y1, x2, y2],
+            "text": text
+        }
+✅ 2) Update cli_pipeline/pipeline_cli.py
+Add these imports at the top:
 Copy code
+Python
+from cli_pipeline.extractors.fcf_extractor import FCFExtractor
+from cli_pipeline.extractors.datum_extractor import DatumExtractor
+In __init__() add:
+Copy code
+Python
+self.fcf_extractor = FCFExtractor()
+self.datum_extractor = DatumExtractor()
+In the group loop, add this:
+Copy code
+Python
+elif label == "FCF":
+    fcf_dir = out_dir / "fcf" / f"view_{vi:02d}_FCF_{gi:02d}"
+    group_rec["fcf"] = self.fcf_extractor.extract(g_crop, fcf_dir)
 
-part_03_dimension_ocr_input.jpg
-That helps you visually confirm why OCR fails.
-If you apply these two updates (tess_ocr_best.py + dim_extractor.py) and run again, you should see:
-✅ parts generated for almost all dimensions
-✅ rotated text OCR becomes readable
-If you want, share 1–2 sample cropped part_*.jpg images and I can tune the preprocessing further (line removal + dilation rules).
+elif label == "DATUM":
+    datum_dir = out_dir / "datum" / f"view_{vi:02d}_DATUM_{gi:02d}"
+    group_rec["datum"] = self.datum_extractor.extract(g_crop, datum_dir)
+✅ 3) Run command
+Same command as before:
+Copy code
+Bash
+python -m cli_pipeline.run_cli ^
+  --img input/drawing.jpg ^
+  --out runs_cli/job1 ^
+  --view-weights weights/0519_view_best.pt ^
+  --group-weights weights/1013_DIMandFCF_best.pt ^
+  --type-weights weights/0324_dim_and_tol_best.pt ^
+  --device 0
+✅ What you will now get
+New folders:
+Copy code
+Text
+runs_cli/job1/
+├── fcf/
+│   └── view_00_FCF_00/
+│       ├── fcf_raw.jpg
+│       ├── cell_00.jpg
+│       ├── cell_01.jpg
+│       └── ...
+└── datum/
+    └── view_00_DATUM_00/
+        ├── datum_raw.jpg
+        └── datum_clean.jpg
+And JSON now includes FCF and Datum results.
+🔥 Next improvement (recommended)
+If your FCF cell detection still misses boxes, I can: ✅ add line-thickness normalization
+✅ merge nearby intersection clusters better
+✅ enforce row/column sorting (so cells are ordered correctly)
+Just share one cropped FCF_00.jpg and I’ll tune it perfectly.
