@@ -1,25 +1,32 @@
-Yep — both issues are expected with HoughLinesP on engineering drawings:
-✅ Why lines are missed
-broken edges (scan noise / gaps)
-thin faint lines → Canny misses them
-dashed/hidden lines break into pieces
-text overlaps and interrupts lines
-✅ Why “double lines” happen
-edges produce two contours (both sides of a thick line)
-Hough detects each side as a separate line → you see “parallel duplicates”
-✅ Fix Strategy (works well in drawings)
-A) Detect lines on a “skeletonized” single-pixel image
-This collapses thick lines into one centerline → removes double edges.
-B) Merge collinear segments afterward
-Even with good detection, Hough returns fragments → we merge them.
-✅ Best Practical Code: line detection without double lines
-This version does:
-✅ binarize
-✅ remove text-ish small blobs
-✅ skeletonize lines (single pixel)
-✅ HoughLinesP
-✅ merge collinear duplicates
-✅ line_detection_fixed.py
+Yep — I can see exactly why from your screenshot.
+The missing lines are mostly the actual part edges (black outlines), while the algorithm is strongly picking up dimension lines / leader lines (thin + long), and some part edges are being broken by:
+hatching
+thick outlines → double edges
+low contrast / scanning noise
+gaps where the outline meets other geometry
+So we need a more engineering-drawing-specific line extractor.
+✅ Best fix: detect “STRUCTURE lines” separately from “ANNOTATION lines”
+In drawings, there are 2 line categories:
+1) Geometry edges (part outline)
+thicker
+continuous
+often axis-aligned
+should be detected
+2) Dimension/leader lines (annotation)
+thin
+extend into white space
+should be ignored OR separated
+Your current method mixes both, and misses some structure edges.
+✅ Improved approach (works much better)
+Step A: Extract edges with LSD (Line Segment Detector)
+OpenCV’s LSD is much better than Hough for engineering drawings because:
+it finds line segments directly from gradients
+less sensitive to broken edges
+reduces duplicates
+Step B: Merge collinear segments
+Step C: Filter out annotation lines (optional)
+✅ Code: Robust Line Detection using LSD + merging
+Create: detect_lines_lsd.py
 Copy code
 Python
 import cv2
@@ -27,162 +34,108 @@ import numpy as np
 import math
 
 
-# -----------------------------
-# Skeletonization (Zhang-Suen style)
-# -----------------------------
-def skeletonize(binary_img):
-    """
-    binary_img: 0 background, 255 foreground
-    returns skeletonized binary image
-    """
-    img = binary_img.copy()
-    img[img > 0] = 255
-
-    skel = np.zeros(img.shape, np.uint8)
-    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-
-    while True:
-        open_img = cv2.morphologyEx(img, cv2.MORPH_OPEN, element)
-        temp = cv2.subtract(img, open_img)
-        eroded = cv2.erode(img, element)
-        skel = cv2.bitwise_or(skel, temp)
-        img = eroded.copy()
-
-        if cv2.countNonZero(img) == 0:
-            break
-
-    return skel
-
-
-# -----------------------------
-# Preprocess for line extraction
-# -----------------------------
-def preprocess_for_lines(img_bgr):
+def preprocess(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Better for scanned drawings
-    bin_img = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31, 7
-    )
+    # Improve contrast
+    gray = cv2.equalizeHist(gray)
 
-    # Remove tiny blobs (text specks / noise)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_img, connectivity=8)
-    cleaned = np.zeros_like(bin_img)
+    # Slight blur to reduce noise
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area > 40:  # keep larger components (lines)
-            cleaned[labels == i] = 255
-
-    # Bridge small gaps in dashed lines
-    kernel = np.ones((3, 3), np.uint8)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    # Skeletonize → removes double edges
-    skel = skeletonize(cleaned)
-
-    return skel
+    return gray
 
 
-# -----------------------------
-# Hough line detection
-# -----------------------------
-def detect_lines_skeleton(skel_img):
-    edges = skel_img  # already 1px lines
-
-    lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=80,
-        minLineLength=50,
-        maxLineGap=15
-    )
+def detect_lines_lsd(gray):
+    """
+    Returns line segments from LSD:
+    [(x1,y1,x2,y2), ...]
+    """
+    lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
+    lines, _, _, _ = lsd.detect(gray)
 
     segs = []
     if lines is not None:
         for l in lines:
             x1, y1, x2, y2 = l[0]
-            segs.append((x1, y1, x2, y2))
+            segs.append((int(x1), int(y1), int(x2), int(y2)))
     return segs
 
 
-# -----------------------------
-# Merge collinear segments
-# -----------------------------
-def angle_of_line(x1, y1, x2, y2):
+def line_length(l):
+    x1, y1, x2, y2 = l
+    return math.hypot(x2 - x1, y2 - y1)
+
+
+def angle_deg(l):
+    x1, y1, x2, y2 = l
     return math.degrees(math.atan2(y2 - y1, x2 - x1))
 
 
-def line_distance(l1, l2):
-    # distance between midpoints
-    x1, y1, x2, y2 = l1
-    a1, b1, a2, b2 = l2
-    m1 = ((x1 + x2) / 2, (y1 + y2) / 2)
-    m2 = ((a1 + a2) / 2, (b1 + b2) / 2)
-    return math.hypot(m1[0] - m2[0], m1[1] - m2[1])
+def midpoint(l):
+    x1, y1, x2, y2 = l
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
 
 
-def merge_lines(lines, angle_thresh=6, dist_thresh=15):
+def merge_lines(lines, angle_thresh=6, dist_thresh=12):
     """
-    Merge lines that are nearly collinear and close.
-    Simple but works well for drawings.
+    Merge nearly collinear and nearby segments into longer segments.
     """
-    merged = []
+    lines = [l for l in lines if line_length(l) > 30]  # remove tiny clutter
     used = [False] * len(lines)
+    merged = []
 
     for i in range(len(lines)):
         if used[i]:
             continue
-        x1, y1, x2, y2 = lines[i]
-        ang1 = angle_of_line(x1, y1, x2, y2)
 
-        group = [lines[i]]
+        base = lines[i]
+        base_ang = angle_deg(base)
+
+        group = [base]
         used[i] = True
 
         for j in range(i + 1, len(lines)):
             if used[j]:
                 continue
-            a1, b1, a2, b2 = lines[j]
-            ang2 = angle_of_line(a1, b1, a2, b2)
 
-            if abs(ang1 - ang2) < angle_thresh or abs(abs(ang1 - ang2) - 180) < angle_thresh:
-                if line_distance(lines[i], lines[j]) < dist_thresh:
+            ang = angle_deg(lines[j])
+            # handle wrap-around angle
+            da = abs(base_ang - ang)
+            da = min(da, abs(da - 180))
+
+            if da < angle_thresh:
+                m1 = midpoint(base)
+                m2 = midpoint(lines[j])
+                if math.hypot(m1[0] - m2[0], m1[1] - m2[1]) < dist_thresh:
                     group.append(lines[j])
                     used[j] = True
 
-        # Merge group into one long segment by extreme endpoints
+        # merge group by farthest endpoints
         pts = []
         for g in group:
             pts.append((g[0], g[1]))
             pts.append((g[2], g[3]))
 
-        # choose farthest pair of points
-        best = None
+        best_pair = None
         best_d = -1
         for p in pts:
             for q in pts:
                 d = math.hypot(p[0] - q[0], p[1] - q[1])
                 if d > best_d:
                     best_d = d
-                    best = (p, q)
+                    best_pair = (p, q)
 
-        (mx1, my1), (mx2, my2) = best
-        merged.append((int(mx1), int(my1), int(mx2), int(my2)))
+        (x1, y1), (x2, y2) = best_pair
+        merged.append((int(x1), int(y1), int(x2), int(y2)))
 
     return merged
 
 
-# -----------------------------
-# Visualization
-# -----------------------------
-def draw_lines(img_bgr, lines):
+def draw_lines(img_bgr, lines, color=(0, 255, 0)):
     out = img_bgr.copy()
-    for (x1, y1, x2, y2) in lines:
-        cv2.line(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    for x1, y1, x2, y2 in lines:
+        cv2.line(out, (x1, y1), (x2, y2), color, 2)
     return out
 
 
@@ -192,37 +145,42 @@ if __name__ == "__main__":
     if img is None:
         raise FileNotFoundError(img_path)
 
-    skel = preprocess_for_lines(img)
-    raw_lines = detect_lines_skeleton(skel)
+    gray = preprocess(img)
+    raw_lines = detect_lines_lsd(gray)
     merged_lines = merge_lines(raw_lines)
 
-    print("Raw lines:", len(raw_lines))
+    print("Raw LSD lines:", len(raw_lines))
     print("Merged lines:", len(merged_lines))
 
-    cv2.imwrite("debug_skeleton.png", skel)
-    cv2.imwrite("lines_raw.png", draw_lines(img, raw_lines))
-    cv2.imwrite("lines_merged.png", draw_lines(img, merged_lines))
+    cv2.imwrite("lsd_raw.png", draw_lines(img, raw_lines))
+    cv2.imwrite("lsd_merged.png", draw_lines(img, merged_lines))
 
-    print("✅ Saved: debug_skeleton.png, lines_raw.png, lines_merged.png")
-✅ What this solves
-✅ “Double lines”
-Skeletonization converts thick edges into one-pixel centerline, so Hough sees only one.
-✅ “Missing lines”
-We add:
-morphological close → bridges gaps
-connected-component cleanup → reduces noise
-better Hough parameters for broken segments
-🔧 If you still miss dashed/hidden lines
-Increase:
+    print("✅ Saved: lsd_raw.png and lsd_merged.png")
+✅ Why this will detect the missing lines in your screenshot
+Your missing lines are thick, continuous structural edges.
+LSD detects them much better than Hough because it follows the gradient of the edge even when:
+broken by hatch lines
+not perfectly sharp
+partially occluded
+🔥 Optional: Remove annotation lines (dimension lines)
+If you want only part outline lines, you can filter:
+remove long thin horizontal/vertical lines that extend into white space
+We can add:
+“line must lie near black pixels on both sides”
+or “line must be part of large connected component”
+But first get all lines properly.
+⚙️ If still missing some edges
+Change thresholds:
+In merge_lines():
 Copy code
 Python
-maxLineGap=25
-threshold=60
-minLineLength=30
-🔥 Best debug outputs to inspect
-This script saves:
-debug_skeleton.png → shows if lines are continuous
-lines_raw.png → raw Hough output
-lines_merged.png → cleaned final lines
-If debug_skeleton.png looks broken, Hough will always miss lines.
-If you upload one sample drawing image, I can tune the exact thresholds (blockSize, Canny, minLineLength) so it detects almost all edges correctly.
+lines = [l for l in lines if line_length(l) > 15]
+In preprocess: replace histogram equalization with CLAHE:
+Copy code
+Python
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+gray = clahe.apply(gray)
+Next step (once lines are correct)
+After line detection works, we can do: ✅ line classification: geometry vs dimension
+✅ dimension-to-line matching using arrowheads/extension lines
+If you want, upload the actual input/example.jpg (not screenshot) and I’ll tune the LSD + filters so it detects all part edges cleanly.
