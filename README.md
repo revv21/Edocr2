@@ -263,3 +263,269 @@ for p in paths:
             cnt[name] += 1
 
 print(cnt)
+Sure ✅ Here is one final single Python script that:
+✅ Loads an SVG
+✅ Extracts:
+Lines (Line)
+Arcs (Arc)
+Curves (CubicBezier / QuadraticBezier) → shown as “arcs/curves”
+Circles/Ellipses (if present as SVG shapes)
+✅ Draws everything into a verification image
+✅ Saves svg_geometry_preview.png
+✅ Install
+Copy code
+Bash
+pip install svgpathtools pillow numpy
+✅ Final Script: svg_detect_geometry_preview.py
+Copy code
+Python
+import math
+import numpy as np
+from PIL import Image, ImageDraw
+
+from svgpathtools import svg2paths2, Line, Arc, CubicBezier, QuadraticBezier
+import xml.etree.ElementTree as ET
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def complex_to_xy(z):
+    return float(z.real), float(z.imag)
+
+
+def parse_viewbox(svg_attr):
+    """
+    Returns (minx, miny, width, height) or None
+    """
+    vb = svg_attr.get("viewBox", None)
+    if vb is None:
+        return None
+    vals = [float(x) for x in vb.replace(",", " ").split()]
+    if len(vals) != 4:
+        return None
+    return vals[0], vals[1], vals[2], vals[3]
+
+
+def infer_bounds_from_points(points):
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)
+
+
+def map_xy(x, y, minx, miny, scale, pad):
+    X = pad + (x - minx) * scale
+    Y = pad + (y - miny) * scale
+    return X, Y
+
+
+def sample_segment(seg, n=30):
+    pts = []
+    for t in np.linspace(0, 1, n):
+        z = seg.point(t)
+        pts.append(complex_to_xy(z))
+    return pts
+
+
+def length_line(l):
+    x1, y1, x2, y2 = l
+    return math.hypot(x2 - x1, y2 - y1)
+
+
+# -----------------------------
+# Extract paths (lines/arcs/curves)
+# -----------------------------
+def extract_from_paths(svg_path):
+    paths, attributes, svg_attr = svg2paths2(svg_path)
+
+    lines = []
+    arcs = []
+    curves = []
+
+    all_points = []
+
+    for path in paths:
+        for seg in path:
+            if isinstance(seg, Line):
+                x1, y1 = complex_to_xy(seg.start)
+                x2, y2 = complex_to_xy(seg.end)
+                lines.append((x1, y1, x2, y2))
+                all_points.extend([(x1, y1), (x2, y2)])
+
+            elif isinstance(seg, Arc):
+                pts = sample_segment(seg, n=40)
+                arcs.append(pts)
+                all_points.extend(pts)
+
+            elif isinstance(seg, (CubicBezier, QuadraticBezier)):
+                pts = sample_segment(seg, n=40)
+                curves.append(pts)
+                all_points.extend(pts)
+
+            else:
+                pts = sample_segment(seg, n=25)
+                curves.append(pts)
+                all_points.extend(pts)
+
+    return lines, arcs, curves, svg_attr, all_points
+
+
+# -----------------------------
+# Extract circles/ellipses from SVG tags
+# -----------------------------
+def extract_circles_ellipses(svg_path):
+    """
+    Extract <circle> and <ellipse> elements if present.
+    Returns list of dicts:
+    circles: {"cx","cy","r"}
+    ellipses: {"cx","cy","rx","ry"}
+    """
+    tree = ET.parse(svg_path)
+    root = tree.getroot()
+
+    # SVG namespaces handling
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+
+    circles = []
+    ellipses = []
+
+    for elem in root.iter():
+        tag = elem.tag
+        if tag == f"{ns}circle":
+            cx = float(elem.attrib.get("cx", 0))
+            cy = float(elem.attrib.get("cy", 0))
+            r = float(elem.attrib.get("r", 0))
+            if r > 0:
+                circles.append({"cx": cx, "cy": cy, "r": r})
+
+        if tag == f"{ns}ellipse":
+            cx = float(elem.attrib.get("cx", 0))
+            cy = float(elem.attrib.get("cy", 0))
+            rx = float(elem.attrib.get("rx", 0))
+            ry = float(elem.attrib.get("ry", 0))
+            if rx > 0 and ry > 0:
+                ellipses.append({"cx": cx, "cy": cy, "rx": rx, "ry": ry})
+
+    return circles, ellipses
+
+
+# -----------------------------
+# Render preview
+# -----------------------------
+def render_preview(
+    lines,
+    arcs,
+    curves,
+    circles,
+    ellipses,
+    svg_attr,
+    all_points,
+    out_path="svg_geometry_preview.png",
+    out_w=2000,
+    out_h=2000,
+    pad=30,
+    min_line_length=0
+):
+    # Determine coordinate bounds
+    viewbox = parse_viewbox(svg_attr)
+
+    if viewbox is not None:
+        minx, miny, vb_w, vb_h = viewbox
+    else:
+        if len(all_points) == 0:
+            raise RuntimeError("No geometry points found in SVG.")
+        minx, miny, vb_w, vb_h = infer_bounds_from_points(all_points)
+
+    scale_x = (out_w - 2 * pad) / (vb_w if vb_w > 1e-6 else 1.0)
+    scale_y = (out_h - 2 * pad) / (vb_h if vb_h > 1e-6 else 1.0)
+    scale = min(scale_x, scale_y)
+
+    img = Image.new("RGB", (out_w, out_h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    # Draw lines (BLACK)
+    for (x1, y1, x2, y2) in lines:
+        if min_line_length > 0 and length_line((x1, y1, x2, y2)) < min_line_length:
+            continue
+        X1, Y1 = map_xy(x1, y1, minx, miny, scale, pad)
+        X2, Y2 = map_xy(x2, y2, minx, miny, scale, pad)
+        draw.line((X1, Y1, X2, Y2), fill=(0, 0, 0), width=1)
+
+    # Draw arcs (RED)
+    for pts in arcs:
+        mapped = [map_xy(x, y, minx, miny, scale, pad) for (x, y) in pts]
+        draw.line(mapped, fill=(255, 0, 0), width=2)
+
+    # Draw curves (ORANGE)
+    for pts in curves:
+        mapped = [map_xy(x, y, minx, miny, scale, pad) for (x, y) in pts]
+        draw.line(mapped, fill=(255, 165, 0), width=2)
+
+    # Draw circles (BLUE)
+    for c in circles:
+        cx, cy, r = c["cx"], c["cy"], c["r"]
+        CX, CY = map_xy(cx, cy, minx, miny, scale, pad)
+        R = r * scale
+        draw.ellipse((CX - R, CY - R, CX + R, CY + R), outline=(0, 0, 255), width=2)
+
+    # Draw ellipses (PURPLE)
+    for e in ellipses:
+        cx, cy, rx, ry = e["cx"], e["cy"], e["rx"], e["ry"]
+        CX, CY = map_xy(cx, cy, minx, miny, scale, pad)
+        RX = rx * scale
+        RY = ry * scale
+        draw.ellipse((CX - RX, CY - RY, CX + RX, CY + RY), outline=(128, 0, 128), width=2)
+
+    img.save(out_path)
+    print(f"✅ Saved preview: {out_path}")
+
+
+# -----------------------------
+# Main
+# -----------------------------
+if __name__ == "__main__":
+    svg_file = "input/drawing.svg"
+
+    lines, arcs, curves, svg_attr, all_points = extract_from_paths(svg_file)
+    circles, ellipses = extract_circles_ellipses(svg_file)
+
+    print("=== Extracted Geometry ===")
+    print("Lines:", len(lines))
+    print("Arcs:", len(arcs))
+    print("Curves (Bezier):", len(curves))
+    print("Circles (SVG tags):", len(circles))
+    print("Ellipses (SVG tags):", len(ellipses))
+
+    render_preview(
+        lines=lines,
+        arcs=arcs,
+        curves=curves,
+        circles=circles,
+        ellipses=ellipses,
+        svg_attr=svg_attr,
+        all_points=all_points,
+        out_path="svg_geometry_preview.png",
+        out_w=2000,
+        out_h=2000,
+        pad=30,
+        min_line_length=0   # set to 5/10/20 to hide tiny segments
+    )
+✅ Output legend (in preview image)
+Black → Straight lines
+Red → True SVG arcs (Arc)
+Orange → Bezier curves (approx arcs/curves)
+Blue → <circle> elements
+Purple → <ellipse> elements
+Saved as:
+📌 svg_geometry_preview.png
+🔧 If your preview looks “too dense”
+Because your SVG has many tiny line segments (hatching / arc approximation).
+Set:
+Copy code
+Python
+min_line_length=15
+or 25 to remove clutter.
+If you upload your SVG file, I can also: ✅ filter out hatching automatically
+✅ separate “part outline” vs “dimension lines” based on layer/style/stroke width
