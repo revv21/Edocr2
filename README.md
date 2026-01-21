@@ -143,3 +143,110 @@ If you want, upload your SVG (or a small sample)
 I’ll tell you: ✅ whether circles are true circles or Bezier paths
 ✅ how to extract only “part outline” and ignore hatching/text
 ✅ how to map SVG coordinates back to your raster image coordinates
+Yes ✅ — the easiest way to verify is to render the extracted SVG lines onto an image (so you visually confirm what got extracted).
+Below is a complete script that:
+✅ reads your SVG
+✅ extracts only straight line segments
+✅ draws them into a PNG overlay
+✅ saves svg_lines_preview.png
+✅ Install
+Copy code
+Bash
+pip install svgpathtools pillow numpy
+✅ preview_svg_lines.py
+Copy code
+Python
+from svgpathtools import svg2paths2, Line
+from PIL import Image, ImageDraw
+import numpy as np
+
+
+def parse_viewbox(svg_attr):
+    """
+    Returns (minx, miny, width, height)
+    """
+    vb = svg_attr.get("viewBox", None)
+    if vb is None:
+        return None
+    vals = [float(x) for x in vb.replace(",", " ").split()]
+    if len(vals) != 4:
+        return None
+    return vals[0], vals[1], vals[2], vals[3]
+
+
+def extract_lines(svg_path):
+    paths, attributes, svg_attr = svg2paths2(svg_path)
+
+    lines = []
+    for path in paths:
+        for seg in path:
+            if isinstance(seg, Line):
+                x1, y1 = float(seg.start.real), float(seg.start.imag)
+                x2, y2 = float(seg.end.real), float(seg.end.imag)
+                lines.append((x1, y1, x2, y2))
+
+    return lines, svg_attr
+
+
+def normalize_to_canvas(lines, viewbox, out_w=2000, out_h=2000, pad=20):
+    """
+    Map SVG coords -> image coords.
+    """
+    if viewbox is None:
+        # fallback: infer bounds from lines
+        xs = [p for l in lines for p in (l[0], l[2])]
+        ys = [p for l in lines for p in (l[1], l[3])]
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        vb_w, vb_h = maxx - minx, maxy - miny
+    else:
+        minx, miny, vb_w, vb_h = viewbox
+
+    scale_x = (out_w - 2 * pad) / (vb_w if vb_w > 1e-6 else 1.0)
+    scale_y = (out_h - 2 * pad) / (vb_h if vb_h > 1e-6 else 1.0)
+    scale = min(scale_x, scale_y)
+
+    mapped = []
+    for x1, y1, x2, y2 in lines:
+        X1 = pad + (x1 - minx) * scale
+        Y1 = pad + (y1 - miny) * scale
+        X2 = pad + (x2 - minx) * scale
+        Y2 = pad + (y2 - miny) * scale
+        mapped.append((X1, Y1, X2, Y2))
+
+    return mapped
+
+
+def draw_lines(lines_xy, out_path="svg_lines_preview.png", out_w=2000, out_h=2000):
+    img = Image.new("RGB", (out_w, out_h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    # Draw all lines in black
+    for x1, y1, x2, y2 in lines_xy:
+        draw.line((x1, y1, x2, y2), fill=(0, 0, 0), width=1)
+
+    img.save(out_path)
+    print(f"✅ Saved: {out_path}")
+
+
+if __name__ == "__main__":
+    svg_file = "input/drawing.svg"
+
+    lines, svg_attr = extract_lines(svg_file)
+    print("Extracted straight lines:", len(lines))
+
+    viewbox = parse_viewbox(svg_attr)
+    mapped = normalize_to_canvas(lines, viewbox, out_w=2000, out_h=2000)
+
+    draw_lines(mapped, out_path="svg_lines_preview.png")
+✅ Output
+You will get:
+📌 svg_lines_preview.png
+This will show only the straight segments extracted from the SVG.
+🔥 If your SVG contains everything as paths (curves too)
+Then straight lines might be few.
+In that case, we can extract “line-like segments” from paths by checking if a segment is almost straight (even if it’s stored as a cubic curve).
+If you want, I’ll extend the script to: ✅ extract near-straight Bezier segments too.
+If you upload your drawing.svg, I can also generate:
+a colored overlay (part edges vs dimension lines)
+filtering to remove hatching/text paths
