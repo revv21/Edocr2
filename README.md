@@ -249,4 +249,17 @@ In that case, we can extract “line-like segments” from paths by checking if 
 If you want, I’ll extend the script to: ✅ extract near-straight Bezier segments too.
 If you upload your drawing.svg, I can also generate:
 a colored overlay (part edges vs dimension lines)
-filtering to remove hatching/text paths
+filtering to remove hatching/text path
+
+from svgpathtools import svg2paths2, Line, Arc, CubicBezier, QuadraticBezier
+
+paths, attrs, svg_attr = svg2paths2("input/drawing.svg")
+
+cnt = {"Line":0, "Arc":0, "CubicBezier":0, "QuadraticBezier":0}
+for p in paths:
+    for seg in p:
+        name = seg.__class__.__name__
+        if name in cnt:
+            cnt[name] += 1
+
+print(cnt)
