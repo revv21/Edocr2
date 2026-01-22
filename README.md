@@ -1,43 +1,97 @@
-Got it ✅ — that’s a very good constraint and it will fix most wrong merges.
-🎯 New rule:
-👉 Only merge chains made of small segments that are diagonal
-(i.e., NOT near-horizontal and NOT near-vertical)
-So we leave true long horizontal/vertical edges alone, and we only “repair” the broken slanted edges.
-✅ What we’ll do
-1) Split segments into:
-HV segments (near 0° or 90°) → keep as-is
-Diagonal small segments → eligible for merging
-Other leftover segments → keep as-is
-2) Chain + merge ONLY the diagonal small segments.
-✅ Code: merge only diagonal small segments
-Add this after you remove arcs/circles + arrowheads:
+Yes ✅ — here’s a clean preview renderer that draws each category in a different color, so you can visually verify what is being kept/merged.
+Categories shown
+Light gray → all original segments (context)
+Blue → hv_keep (horizontal/vertical kept)
+Orange → other_keep (long diagonal kept)
+Purple → diag_small (tiny diagonal candidates)
+Black → merged_diag (final merged diagonal lines)
+Red → leftover_diag (diagonal small segments that didn’t merge)
+✅ Code: Preview all categories in different colors
+Add this function:
 Copy code
 Python
 import numpy as np
-import math
+from PIL import Image, ImageDraw
 
-def segment_angle_deg(p1, p2):
-    v = p2 - p1
-    ang = math.degrees(math.atan2(v[1], v[0]))
-    ang = abs(ang)
-    if ang > 90:
-        ang = 180 - ang
-    return ang  # in [0,90]
+def render_categories_preview(
+    all_segments,
+    hv_keep,
+    other_keep,
+    diag_small,
+    merged_diag,
+    leftover_diag,
+    out_path="categories_preview.png",
+    size=2000,
+    pad=30
+):
+    # Collect bounds
+    pts = []
+    for p1, p2 in all_segments:
+        pts.append(p1); pts.append(p2)
 
-def is_near_horizontal_or_vertical(p1, p2, hv_tol_deg=8):
-    ang = segment_angle_deg(p1, p2)
-    return (ang <= hv_tol_deg) or (abs(90 - ang) <= hv_tol_deg)
+    pts = np.asarray(pts, dtype=np.float32)
+    minx, miny = float(pts[:, 0].min()), float(pts[:, 1].min())
+    maxx, maxy = float(pts[:, 0].max()), float(pts[:, 1].max())
+    w = maxx - minx
+    h = maxy - miny
+    scale = min((size - 2 * pad) / (w + 1e-6), (size - 2 * pad) / (h + 1e-6))
 
-def merge_only_diagonal_small_segments(segments,
-                                      small_len=3.0,
-                                      hv_tol_deg=8,
-                                      join_dist=3.0,
-                                      straight_dev=1.0):
-    """
-    segments: list of (p1,p2) after arc/circle + arrowhead removal
-    Returns:
-      final_lines = kept_segments + merged_diagonal_lines
-    """
+    def map_pt(p):
+        X = pad + (p[0] - minx) * scale
+        Y = pad + (p[1] - miny) * scale
+        return (float(X), float(Y))
+
+    img = Image.new("RGB", (size, size), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    # 1) Draw ALL segments in light gray (context)
+    for p1, p2 in all_segments:
+        x1, y1 = map_pt(p1)
+        x2, y2 = map_pt(p2)
+        draw.line((x1, y1, x2, y2), fill=(230, 230, 230), width=1)
+
+    # Helper for category drawing
+    def draw_segments(seg_list, color, width):
+        for p1, p2 in seg_list:
+            x1, y1 = map_pt(p1)
+            x2, y2 = map_pt(p2)
+            draw.line((x1, y1, x2, y2), fill=color, width=width)
+
+    # 2) Draw categories
+    draw_segments(hv_keep,       color=(0, 0, 255),     width=2)  # Blue
+    draw_segments(other_keep,    color=(255, 165, 0),   width=2)  # Orange
+    draw_segments(diag_small,    color=(160, 32, 240),  width=1)  # Purple
+    draw_segments(leftover_diag, color=(255, 0, 0),     width=2)  # Red
+    draw_segments(merged_diag,   color=(0, 0, 0),       width=3)  # Black
+
+    # Add legend text
+    legend = [
+        ("Blue  : HV keep", (0, 0, 255)),
+        ("Orange: other keep", (255, 165, 0)),
+        ("Purple: diag_small (merge candidates)", (160, 32, 240)),
+        ("Black : merged_diag", (0, 0, 0)),
+        ("Red   : leftover_diag", (255, 0, 0)),
+        ("Gray  : all segments (context)", (120, 120, 120)),
+    ]
+
+    y = 10
+    for txt, col in legend:
+        draw.text((10, y), txt, fill=col)
+        y += 22
+
+    img.save(out_path)
+    print(f"✅ Saved category preview: {out_path}")
+✅ Modify your merge function to RETURN categories
+Update your merge function like this:
+Copy code
+Python
+def merge_only_diagonal_small_segments_return_categories(
+    segments,
+    small_len=3.0,
+    hv_tol_deg=8,
+    join_dist=3.0,
+    straight_dev=1.0
+):
     hv_keep = []
     diag_small = []
     other_keep = []
@@ -46,17 +100,14 @@ def merge_only_diagonal_small_segments(segments,
         L = float(np.linalg.norm(p2 - p1))
 
         if is_near_horizontal_or_vertical(p1, p2, hv_tol_deg=hv_tol_deg):
-            # do NOT merge HV lines (keep stable)
             hv_keep.append((p1, p2))
             continue
 
-        # diagonal
         if L <= small_len:
             diag_small.append((p1, p2))
         else:
             other_keep.append((p1, p2))
 
-    # Now merge ONLY diagonal small segments
     merged_diag, leftover_diag = merge_remaining_lines(
         diag_small,
         join_dist=join_dist,
@@ -64,38 +115,52 @@ def merge_only_diagonal_small_segments(segments,
     )
 
     final_lines = hv_keep + other_keep + merged_diag + leftover_diag
-    return final_lines, {
+
+    stats = {
         "hv_keep": len(hv_keep),
         "other_keep": len(other_keep),
         "diag_small": len(diag_small),
         "merged_diag": len(merged_diag),
         "leftover_diag": len(leftover_diag),
     }
-Then in your main pipeline replace the old merging call with:
+
+    categories = {
+        "hv_keep": hv_keep,
+        "other_keep": other_keep,
+        "diag_small": diag_small,
+        "merged_diag": merged_diag,
+        "leftover_diag": leftover_diag,
+        "final_lines": final_lines
+    }
+
+    return final_lines, stats, categories
+✅ Use it in your main code
 Copy code
 Python
-final_lines, stats = merge_only_diagonal_small_segments(
+final_lines, stats, cats = merge_only_diagonal_small_segments_return_categories(
     remaining2,
-    small_len=3.0,       # merge only small diagonal segments
-    hv_tol_deg=8,        # treat ±8° as horizontal/vertical
+    small_len=3.0,
+    hv_tol_deg=8,
     join_dist=3.0,
     straight_dev=1.0
 )
 
 print("Diagonal merge stats:", stats)
-✅ Why this fixes your issue
-Your previous merging was wrong because:
-it was merging any connected segments
-even horizontal/vertical edges (which are already correct)
-and sometimes merging parts of shapes incorrectly
-Now we only merge: ✅ broken diagonal edges
-and we avoid: ❌ messing up axis-aligned edges
-🔧 Tuning (important)
-If diagonal edges are still not merging:
-increase join_dist → 4.0
-increase small_len → 5.0
-If wrong diagonal merges happen:
-decrease straight_dev → 0.7
-decrease join_dist → 2.0
-If you want, I can also add one more safety rule:
-✅ merge diagonal chains only if the chain length after merge is > some minimum length, so we don’t merge random tiny diagonal clutter (like hatch noise).
+
+render_categories_preview(
+    all_segments=segments,                 # original segments
+    hv_keep=cats["hv_keep"],
+    other_keep=cats["other_keep"],
+    diag_small=cats["diag_small"],
+    merged_diag=cats["merged_diag"],
+    leftover_diag=cats["leftover_diag"],
+    out_path="categories_preview.png"
+)
+✅ Output
+You’ll get:
+📌 categories_preview.png
+and it will clearly show if:
+HV lines are staying correct (blue)
+diagonal broken pieces are merging (black)
+remaining clutter is still present (red/purple)
+If you want, I can also add a “zoomed crop preview” around each merged diagonal line, so you can inspect each merge result one-by-one.
