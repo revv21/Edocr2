@@ -1,30 +1,55 @@
-Yes ✅ — SVG-based arrowhead detection is actually cleaner and more reliable than raster, because arrowheads become small triangular shapes made of short line segments.
-Below is a direct SVG arrowhead detector that:
-✅ loads SVG
-✅ extracts all line segments
-✅ finds small closed triangles (3 edges)
-✅ returns:
-triangle vertices
-tip point (sharpest vertex)
-bounding box
-saves a preview image svg_arrowheads_preview.png
-⚠️ Note
-Some earlier uploaded repo files expired on my side, but this code is standalone and doesn’t need them.
+Perfect ✅ — below is a single final pipeline script that does everything end-to-end:
+✅ Input: drawing.svg
+✅ Output:
+geometry.json (merged lines + detected arcs + detected circles)
+geometry_preview.png (visual verification)
+It solves your exact problem:
+✅ slanted straight edges broken into tiny segments → merged into long lines
+✅ arcs/circles made of tiny segments → reconstructed by chaining + circle fitting
+✅ keeps clutter visible but highlights extracted primitives
+🔥 Brief logic / pipeline (what we do)
+Step 1: Extract raw SVG line segments
+Most converters store everything as <path> segments → we extract all Line segments.
+Step 2: Merge “broken straight lines”
+Many slanted edges become many tiny collinear segments. So we:
+chain connected segments by endpoint proximity
+check if the chain is “almost straight” using PCA + max deviation
+merge the chain into one long line
+➡️ Output: merged_lines
+Step 3: Build curve chains from remaining tiny segments
+From the leftover segments (not merged into straight lines), we:
+chain connected segments again
+these chains often represent arcs/circles/hatching
+Step 4: Fit circles to chains
+For each chain:
+fit a circle using least squares
+compute RMSE error
+compute angle coverage (how much of circle it covers)
+If:
+coverage ~ full → circle
+coverage partial → arc
+➡️ Output: detected_circles, detected_arcs
+Step 5: Save JSON + Preview Image
+draw merged lines (black)
+draw arcs (red)
+draw circles (blue)
+draw leftover clutter (light gray)
 ✅ Install
 Copy code
 Bash
 pip install svgpathtools pillow numpy
-✅ Final Code: svg_detect_arrowheads.py
+✅ Final Script: svg_geometry_pipeline.py
 Copy code
 Python
 import math
+import json
 import numpy as np
 from PIL import Image, ImageDraw
 from svgpathtools import svg2paths2, Line
 
 
 # -----------------------------
-# Helpers
+# Basic helpers
 # -----------------------------
 def complex_to_xy(z):
     return np.array([float(z.real), float(z.imag)], dtype=np.float32)
@@ -34,45 +59,24 @@ def seg_length(p1, p2):
     return float(np.linalg.norm(p2 - p1))
 
 
-def angle(p1, p2, p3):
-    """
-    Angle at p2 for triangle p1-p2-p3 (degrees)
-    """
-    a = p1 - p2
-    b = p3 - p2
-    na = np.linalg.norm(a)
-    nb = np.linalg.norm(b)
-    if na < 1e-6 or nb < 1e-6:
-        return 180.0
-    cosv = float(np.clip(np.dot(a, b) / (na * nb), -1, 1))
+def angle_between(v1, v2):
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 < 1e-6 or n2 < 1e-6:
+        return 0.0
+    cosv = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1, 1))
     return math.degrees(math.acos(cosv))
 
 
-def triangle_tip(tri_pts):
-    """
-    tri_pts: list of 3 points (np arrays)
-    tip = sharpest corner (min internal angle)
-    """
-    p0, p1, p2 = tri_pts
-    ang0 = angle(p1, p0, p2)
-    ang1 = angle(p0, p1, p2)
-    ang2 = angle(p0, p2, p1)
-
-    angs = [ang0, ang1, ang2]
-    idx = int(np.argmin(angs))
-    return tri_pts[idx], float(angs[idx])
-
-
-def round_point(p, grid=1.0):
-    """
-    Quantize point so near-equal endpoints can match.
-    grid=1.0 means round to integer coords.
-    """
-    return (round(float(p[0]) / grid) * grid, round(float(p[1]) / grid) * grid)
+def point_line_distance(pt, a, b):
+    v = b - a
+    if np.linalg.norm(v) < 1e-6:
+        return float(np.linalg.norm(pt - a))
+    return float(np.abs(np.cross(v, pt - a)) / np.linalg.norm(v))
 
 
 # -----------------------------
-# Extract SVG line segments
+# Extract raw SVG line segments
 # -----------------------------
 def extract_svg_lines(svg_path):
     paths, attributes, svg_attr = svg2paths2(svg_path)
@@ -86,142 +90,288 @@ def extract_svg_lines(svg_path):
                 if seg_length(p1, p2) > 1e-6:
                     segs.append((p1, p2))
 
-    return segs, svg_attr
+    return segs
 
 
 # -----------------------------
-# Detect triangles (arrowheads)
+# Chain segments by endpoint proximity
 # -----------------------------
-def detect_arrowhead_triangles(
-    segments,
-    max_edge_len=10.0,
-    min_edge_len=0.3,
-    join_tol=1.5,
-    quant_grid=1.0,
-    min_area=0.5,
-    max_area=200.0,
-    min_sharp_angle=10,
-    max_sharp_angle=75
-):
+def chain_segments(segments, join_dist=2.5, max_turn_deg=70):
     """
-    Detect arrowheads as small closed triangles made of 3 short line segments.
-    Returns list of arrowheads:
-    [
-      {
-        "vertices": [p0,p1,p2],
-        "tip": tip_point,
-        "sharp_angle": angle,
-        "bbox": (minx,miny,maxx,maxy)
-      }
-    ]
+    Connect segments into chains:
+    chain = [p0, p1, p2, ...]
     """
+    unused = [True] * len(segments)
 
-    # Keep only small segments (arrowheads are small)
-    small = []
-    for p1, p2 in segments:
-        L = seg_length(p1, p2)
-        if min_edge_len <= L <= max_edge_len:
-            small.append((p1, p2))
+    endpoints = []
+    for i, (p1, p2) in enumerate(segments):
+        endpoints.append((i, 0, p1[0], p1[1]))
+        endpoints.append((i, 1, p2[0], p2[1]))
+    endpoints = np.array(endpoints, dtype=np.float32)
 
-    # Build adjacency by quantized endpoints
-    # node -> list of connected nodes
-    graph = {}
-    edges = set()
+    def candidates(pt):
+        dx = endpoints[:, 2] - pt[0]
+        dy = endpoints[:, 3] - pt[1]
+        dist = np.sqrt(dx * dx + dy * dy)
+        return np.where(dist <= join_dist)[0]
 
-    def add_edge(a, b):
-        if a not in graph:
-            graph[a] = []
-        if b not in graph:
-            graph[b] = []
-        graph[a].append(b)
-        graph[b].append(a)
-        edges.add(tuple(sorted([a, b])))
+    chains = []
 
-    # Insert edges
-    for p1, p2 in small:
-        a = round_point(p1, grid=quant_grid)
-        b = round_point(p2, grid=quant_grid)
-
-        # ignore tiny degenerate edges
-        if a == b:
+    for i in range(len(segments)):
+        if not unused[i]:
             continue
 
-        add_edge(a, b)
+        p1, p2 = segments[i]
+        unused[i] = False
+        chain = [p1, p2]
 
-    # Find triangles in the graph: (u,v,w) where all 3 edges exist
-    nodes = list(graph.keys())
-    triangles = set()
+        # forward extend
+        last_dir = p2 - p1
+        while True:
+            tip = chain[-1]
+            cand_idxs = candidates(tip)
 
-    for u in nodes:
-        nbrs = graph[u]
-        if len(nbrs) < 2:
-            continue
-        for i in range(len(nbrs)):
-            for j in range(i + 1, len(nbrs)):
-                v = nbrs[i]
-                w = nbrs[j]
-                # check if v-w is an edge
-                if tuple(sorted([v, w])) in edges:
-                    tri = tuple(sorted([u, v, w]))
-                    triangles.add(tri)
+            best = None
+            best_turn = 1e9
 
-    arrowheads = []
+            for ci in cand_idxs:
+                seg_id = int(endpoints[ci, 0])
+                end_id = int(endpoints[ci, 1])
 
-    for tri in triangles:
-        pts = [np.array([tri[0][0], tri[0][1]], dtype=np.float32),
-               np.array([tri[1][0], tri[1][1]], dtype=np.float32),
-               np.array([tri[2][0], tri[2][1]], dtype=np.float32)]
+                if seg_id < 0 or seg_id >= len(segments):
+                    continue
+                if not unused[seg_id]:
+                    continue
 
-        # Area filter
-        x1, y1 = pts[0]
-        x2, y2 = pts[1]
-        x3, y3 = pts[2]
-        area = abs(0.5 * ((x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1)))
-        if not (min_area <= area <= max_area):
-            continue
+                a, b = segments[seg_id]
+                if end_id == 0:
+                    cur, nxt = a, b
+                else:
+                    cur, nxt = b, a
 
-        tip, sharp = triangle_tip(pts)
-        if not (min_sharp_angle <= sharp <= max_sharp_angle):
-            continue
+                if np.linalg.norm(cur - tip) > join_dist:
+                    continue
 
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        bbox = (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys)))
+                new_dir = nxt - cur
+                turn = angle_between(last_dir, new_dir)
 
-        arrowheads.append({
-            "vertices": [(float(p[0]), float(p[1])) for p in pts],
-            "tip": (float(tip[0]), float(tip[1])),
-            "sharp_angle": sharp,
-            "bbox": bbox,
-            "area": float(area),
-        })
+                if turn <= max_turn_deg and turn < best_turn:
+                    best_turn = turn
+                    best = (seg_id, nxt, new_dir)
 
-    # Remove duplicates (same bbox)
-    uniq = []
-    seen = set()
-    for a in arrowheads:
-        key = tuple(round(v, 1) for v in a["bbox"])
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(a)
+            if best is None:
+                break
 
-    # sort by sharpness (more arrow-like)
-    uniq.sort(key=lambda x: x["sharp_angle"])
-    return uniq
+            seg_id, nxt, new_dir = best
+            unused[seg_id] = False
+            chain.append(nxt)
+            last_dir = new_dir
+
+        # backward extend
+        last_dir = chain[0] - chain[1]
+        while True:
+            tip = chain[0]
+            cand_idxs = candidates(tip)
+
+            best = None
+            best_turn = 1e9
+
+            for ci in cand_idxs:
+                seg_id = int(endpoints[ci, 0])
+                end_id = int(endpoints[ci, 1])
+
+                if seg_id < 0 or seg_id >= len(segments):
+                    continue
+                if not unused[seg_id]:
+                    continue
+
+                a, b = segments[seg_id]
+                if end_id == 0:
+                    cur, nxt = a, b
+                else:
+                    cur, nxt = b, a
+
+                if np.linalg.norm(cur - tip) > join_dist:
+                    continue
+
+                new_dir = nxt - cur
+                turn = angle_between(last_dir, new_dir)
+
+                if turn <= max_turn_deg and turn < best_turn:
+                    best_turn = turn
+                    best = (seg_id, nxt, new_dir)
+
+            if best is None:
+                break
+
+            seg_id, nxt, new_dir = best
+            unused[seg_id] = False
+            chain.insert(0, nxt)
+            last_dir = new_dir
+
+        if len(chain) >= 2:
+            chains.append(chain)
+
+    return chains
 
 
 # -----------------------------
-# Render preview
+# Straightness test + merge chain
 # -----------------------------
-def render_preview(segments, arrowheads, out_path="svg_arrowheads_preview.png", size=2000, pad=30):
-    # bounds from all segments
+def chain_is_straight(chain_pts, max_dev=1.0):
+    pts = np.asarray(chain_pts, dtype=np.float32)
+
+    # PCA direction
+    mean = pts.mean(axis=0)
+    centered = pts - mean
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    direction = vt[0]
+
+    a = mean - 1000 * direction
+    b = mean + 1000 * direction
+
+    devs = [point_line_distance(p, a, b) for p in pts]
+    return max(devs) <= max_dev
+
+
+def merge_chain_to_line(chain_pts):
+    pts = np.asarray(chain_pts, dtype=np.float32)
+    best_d = -1
+    best_pair = None
+
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d = np.linalg.norm(pts[j] - pts[i])
+            if d > best_d:
+                best_d = d
+                best_pair = (pts[i], pts[j])
+
+    return best_pair  # (p1,p2)
+
+
+def merge_broken_straight_lines(raw_segments, join_dist=2.5, straight_dev=1.0):
+    """
+    Chains segments and merges straight chains into long lines.
+    Returns (merged_lines, leftover_segments)
+    """
+    chains = chain_segments(raw_segments, join_dist=join_dist, max_turn_deg=60)
+
+    merged_lines = []
+    leftover_segments = []
+
+    for ch in chains:
+        if len(ch) >= 3 and chain_is_straight(ch, max_dev=straight_dev):
+            merged_lines.append(merge_chain_to_line(ch))
+        else:
+            for i in range(len(ch) - 1):
+                leftover_segments.append((ch[i], ch[i + 1]))
+
+    return merged_lines, leftover_segments
+
+
+# -----------------------------
+# Circle fitting from chains
+# -----------------------------
+def fit_circle_least_squares(points):
+    pts = np.asarray(points, dtype=np.float32)
+    x = pts[:, 0]
+    y = pts[:, 1]
+
+    A = np.column_stack([x, y, np.ones_like(x)])
+    b = -(x * x + y * y)
+
+    sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    a, b_, c = sol
+
+    cx = -a / 2.0
+    cy = -b_ / 2.0
+    r = math.sqrt(max(0.0, cx * cx + cy * cy - c))
+
+    d = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    rmse = float(np.sqrt(np.mean((d - r) ** 2)))
+
+    return cx, cy, r, rmse
+
+
+def arc_coverage_degrees(points, cx, cy):
+    pts = np.asarray(points, dtype=np.float32)
+    ang = np.degrees(np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx))
+    ang = (ang + 360.0) % 360.0
+    ang_sorted = np.sort(ang)
+
+    diffs = np.diff(ang_sorted)
+    wrap_gap = (ang_sorted[0] + 360.0) - ang_sorted[-1]
+    gaps = np.concatenate([diffs, [wrap_gap]])
+    max_gap = float(np.max(gaps))
+    return 360.0 - max_gap
+
+
+def detect_arcs_circles_from_leftover(leftover_segments,
+                                      join_dist=2.5,
+                                      rmse_thresh=1.2,
+                                      min_radius=8,
+                                      min_coverage_deg=60):
+    """
+    Chain leftover segments -> fit circles.
+    """
+    chains = chain_segments(leftover_segments, join_dist=join_dist, max_turn_deg=80)
+
+    arcs = []
+    circles = []
+    other = []
+
+    for ch in chains:
+        if len(ch) < 10:
+            other.append(ch)
+            continue
+
+        cx, cy, r, rmse = fit_circle_least_squares(ch)
+        if r < min_radius or rmse > rmse_thresh:
+            other.append(ch)
+            continue
+
+        coverage = arc_coverage_degrees(ch, cx, cy)
+        if coverage < min_coverage_deg:
+            other.append(ch)
+            continue
+
+        item = {
+            "center": [float(cx), float(cy)],
+            "radius": float(r),
+            "rmse": float(rmse),
+            "coverage_deg": float(coverage),
+            "polyline": [[float(p[0]), float(p[1])] for p in ch]
+        }
+
+        if coverage > 300:
+            circles.append(item)
+        else:
+            arcs.append(item)
+
+    return arcs, circles, other
+
+
+# -----------------------------
+# Preview rendering
+# -----------------------------
+def render_preview(raw_lines, merged_lines, leftover_segments, arcs, circles,
+                   out_path="geometry_preview.png", size=2000, pad=30):
     pts = []
-    for p1, p2 in segments:
-        pts.append(p1)
-        pts.append(p2)
-    pts = np.asarray(pts, dtype=np.float32)
 
+    for p1, p2 in raw_lines:
+        pts.append(p1); pts.append(p2)
+    for p1, p2 in merged_lines:
+        pts.append(p1); pts.append(p2)
+    for p1, p2 in leftover_segments:
+        pts.append(p1); pts.append(p2)
+    for a in arcs:
+        for p in a["polyline"]:
+            pts.append(np.array(p, dtype=np.float32))
+    for c in circles:
+        for p in c["polyline"]:
+            pts.append(np.array(p, dtype=np.float32))
+
+    pts = np.asarray(pts, dtype=np.float32)
     minx, miny = float(pts[:, 0].min()), float(pts[:, 1].min())
     maxx, maxy = float(pts[:, 0].max()), float(pts[:, 1].max())
     w = maxx - minx
@@ -236,62 +386,130 @@ def render_preview(segments, arrowheads, out_path="svg_arrowheads_preview.png", 
     img = Image.new("RGB", (size, size), (255, 255, 255))
     draw = ImageDraw.Draw(img)
 
-    # draw all segments light gray
-    for p1, p2 in segments:
+    # raw lines (very light gray)
+    for p1, p2 in raw_lines:
         x1, y1 = map_pt(p1)
         x2, y2 = map_pt(p2)
-        draw.line((x1, y1, x2, y2), fill=(210, 210, 210), width=1)
+        draw.line((x1, y1, x2, y2), fill=(230, 230, 230), width=1)
 
-    # draw arrowheads
-    for a in arrowheads:
-        verts = [np.array(v, dtype=np.float32) for v in a["vertices"]]
-        tip = np.array(a["tip"], dtype=np.float32)
+    # merged long lines (black)
+    for p1, p2 in merged_lines:
+        x1, y1 = map_pt(p1)
+        x2, y2 = map_pt(p2)
+        draw.line((x1, y1, x2, y2), fill=(0, 0, 0), width=2)
 
-        mapped_verts = [map_pt(v) for v in verts]
-        draw.polygon(mapped_verts, outline=(0, 200, 0), fill=None)
+    # arcs (red)
+    for a in arcs:
+        pts2 = [map_pt(np.array(p, dtype=np.float32)) for p in a["polyline"]]
+        draw.line(pts2, fill=(255, 0, 0), width=3)
 
-        tx, ty = map_pt(tip)
-        draw.ellipse((tx - 4, ty - 4, tx + 4, ty + 4), fill=(255, 0, 0))
+    # circles (blue outline)
+    for c in circles:
+        cx, cy = c["center"]
+        r = c["radius"]
+        C = np.array([cx, cy], dtype=np.float32)
+        CX, CY = map_pt(C)
+        R = r * scale
+        draw.ellipse((CX - R, CY - R, CX + R, CY + R), outline=(0, 0, 255), width=3)
 
     img.save(out_path)
     print(f"✅ Saved preview: {out_path}")
 
 
 # -----------------------------
-# Main
+# Main pipeline
 # -----------------------------
 if __name__ == "__main__":
     svg_file = "input/drawing.svg"
 
-    segments, svg_attr = extract_svg_lines(svg_file)
-    print("Total SVG line segments:", len(segments))
+    # 1) Extract all raw line segments from SVG
+    raw_lines = extract_svg_lines(svg_file)
+    print("Raw SVG line segments:", len(raw_lines))
 
-    arrowheads = detect_arrowhead_triangles(
-        segments,
-        max_edge_len=12.0,      # tune depending on SVG scale
-        min_edge_len=0.2,
-        quant_grid=1.0,
-        min_area=0.8,
-        max_area=300.0,
-        min_sharp_angle=10,
-        max_sharp_angle=75
+    # 2) Merge broken straight lines (including slanted)
+    merged_lines, leftover_segments = merge_broken_straight_lines(
+        raw_segments=raw_lines,
+        join_dist=2.5,
+        straight_dev=1.0
     )
+    print("Merged straight lines:", len(merged_lines))
+    print("Leftover segments:", len(leftover_segments))
 
-    print("Arrowheads detected:", len(arrowheads))
+    # 3) Detect arcs/circles from leftover segments
+    arcs, circles, other_chains = detect_arcs_circles_from_leftover(
+        leftover_segments,
+        join_dist=3.0,
+        rmse_thresh=1.2,
+        min_radius=8,
+        min_coverage_deg=60
+    )
+    print("Detected arcs:", len(arcs))
+    print("Detected circles:", len(circles))
 
-    render_preview(segments, arrowheads, out_path="svg_arrowheads_preview.png")
-✅ Output
-You’ll get:
-📌 svg_arrowheads_preview.png
-light gray = all SVG segments
-green triangle outlines = detected arrowheads
-red dot = arrowhead tip
-🔧 If it detects too many / too few arrowheads
-SVG units vary a LOT depending on converter.
-If too many false triangles:
-decrease max_edge_len (like 6.0)
-increase min_area (like 3.0)
-If too few:
-increase max_edge_len (like 20.0)
-increase quant_grid slightly (2.0)
-If you upload your SVG, I can tune these thresholds exactly so it detects only real arrowheads from dimension lines.
+    # 4) Save JSON
+    geometry = {
+        "merged_lines": [
+            {
+                "x1": float(p1[0]), "y1": float(p1[1]),
+                "x2": float(p2[0]), "y2": float(p2[1]),
+            }
+            for (p1, p2) in merged_lines
+        ],
+        "arcs": arcs,
+        "circles": circles
+    }
+
+    with open("geometry.json", "w", encoding="utf-8") as f:
+        json.dump(geometry, f, indent=2)
+
+    print("✅ Saved geometry.json")
+
+    # 5) Render preview
+    render_preview(
+        raw_lines=raw_lines,
+        merged_lines=merged_lines,
+        leftover_segments=leftover_segments,
+        arcs=arcs,
+        circles=circles,
+        out_path="geometry_preview.png",
+        size=2000
+    )
+✅ What you should expect
+geometry_preview.png
+Black = merged straight edges (including slanted edges)
+Red = arcs detected from leftover tiny segments
+Blue = circles detected from leftover tiny segments
+Light gray = raw clutter (just for context)
+geometry.json
+Contains clean primitives you can now use for:
+dimension matching
+snapping arrowheads to nearest edge/circle/arc
+tolerance analysis later
+🔧 Tuning tips (if output isn’t perfect)
+If slanted lines still don’t merge:
+Increase:
+Copy code
+Python
+join_dist=4.0
+straight_dev=1.5
+If wrong merges happen (hatching becomes a “line”):
+Decrease:
+Copy code
+Python
+straight_dev=0.6
+If arcs are missed:
+Relax:
+Copy code
+Python
+rmse_thresh=2.0
+min_coverage_deg=40
+If too many false circles:
+Tighten:
+Copy code
+Python
+rmse_thresh=0.8
+min_radius=15
+If you want, next I can integrate this directly into your view → DIM detection pipeline, so for each view crop you generate:
+view_00_geometry.json
+view_00_geometry_preview.png
+and later we can do dimension-to-geometry matching on that view only (much easier + faster).
