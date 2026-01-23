@@ -93,3 +93,5 @@ But if your goal is clean CAD edges only, your request makes sense.
 If you want, I can integrate this into your full pipeline and output:
 final_lines.json
 final_lines_preview.png
+
+https://smailiitmacin-my.sharepoint.com/:u:/g/personal/ed22b063_smail_iitm_ac_in/IQBsDueESb-ASqrfZY3A7Z1nAa9IaMW0rY2x63G4LNe6ljA?e=E59w4E
