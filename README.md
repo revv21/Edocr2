@@ -253,3 +253,153 @@ If you want next:
 ✅ per-merged-line zoom crops
 ✅ direct DXF export
 Just say the word.
+
+import math
+import numpy as np
+
+
+def segment_angle(p1, p2):
+    v = p2 - p1
+    ang = math.degrees(math.atan2(v[1], v[0]))
+    if ang < 0:
+        ang += 180.0      # undirected line
+    return ang            # [0, 180)
+
+
+def is_near_horizontal_or_vertical(p1, p2, hv_tol_deg=8):
+    ang = segment_angle(p1, p2)
+    return (ang <= hv_tol_deg) or (abs(ang - 90) <= hv_tol_deg)
+
+
+def merge_diagonal_segments_strict(
+    segments,
+    hv_tol_deg=8,
+    angle_tol_deg=6,
+    join_dist=3.5,
+    proj_tol=1.2
+):
+    """
+    Returns:
+      final_lines,
+      stats,
+      cats
+    """
+
+    # -------------------------------------------------
+    # 1) Split HV vs diagonal
+    # -------------------------------------------------
+    hv_keep = []
+    diagonals = []
+
+    for p1, p2 in segments:
+        if is_near_horizontal_or_vertical(p1, p2, hv_tol_deg):
+            hv_keep.append((p1, p2))
+        else:
+            diagonals.append((p1, p2))
+
+    used = [False] * len(diagonals)
+    merged_diag = []
+    leftover_diag = []
+
+    # -------------------------------------------------
+    # 2) Strict diagonal merging
+    # -------------------------------------------------
+    for i, (p1, p2) in enumerate(diagonals):
+        if used[i]:
+            continue
+
+        chain = [p1, p2]
+        used[i] = True
+
+        base_dir = p2 - p1
+        base_dir /= (np.linalg.norm(base_dir) + 1e-6)
+        base_ang = segment_angle(p1, p2)
+
+        growing = True
+        while growing:
+            growing = False
+
+            for j, (q1, q2) in enumerate(diagonals):
+                if used[j]:
+                    continue
+
+                ang = segment_angle(q1, q2)
+                if abs(ang - base_ang) > angle_tol_deg:
+                    continue
+
+                for side in ("start", "end"):
+                    tip = chain[0] if side == "start" else chain[-1]
+
+                    d1 = np.linalg.norm(q1 - tip)
+                    d2 = np.linalg.norm(q2 - tip)
+
+                    if min(d1, d2) > join_dist:
+                        continue
+
+                    nxt = q2 if d1 < d2 else q1
+
+                    # projection / collinearity check
+                    v = nxt - chain[0]
+                    perp = v - np.dot(v, base_dir) * base_dir
+                    if np.linalg.norm(perp) > proj_tol:
+                        continue
+
+                    # accept
+                    used[j] = True
+                    growing = True
+
+                    if side == "start":
+                        chain.insert(0, nxt)
+                    else:
+                        chain.append(nxt)
+                    break
+
+                if growing:
+                    break
+
+        # -------------------------------------------------
+        # 3) Merge chain into a single line
+        # -------------------------------------------------
+        pts = np.asarray(chain, dtype=np.float32)
+        best_d = -1
+        best_pair = None
+
+        for a in pts:
+            for b in pts:
+                d = np.linalg.norm(b - a)
+                if d > best_d:
+                    best_d = d
+                    best_pair = (a, b)
+
+        if best_pair is not None:
+            merged_diag.append(best_pair)
+
+    # -------------------------------------------------
+    # 4) Collect leftovers (diagonals not used)
+    # -------------------------------------------------
+    for i, (p1, p2) in enumerate(diagonals):
+        if not used[i]:
+            leftover_diag.append((p1, p2))
+
+    # -------------------------------------------------
+    # 5) Outputs
+    # -------------------------------------------------
+    final_lines = hv_keep + merged_diag
+
+    stats = {
+        "hv_keep": len(hv_keep),
+        "diag_total": len(diagonals),
+        "merged_diag": len(merged_diag),
+        "leftover_diag": len(leftover_diag),
+        "final_lines": len(final_lines),
+    }
+
+    cats = {
+        "hv_keep": hv_keep,
+        "diag_all": diagonals,
+        "merged_diag": merged_diag,
+        "leftover_diag": leftover_diag,
+        "final_lines": final_lines,
+    }
+
+    return final_lines, stats, cats
