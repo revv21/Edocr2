@@ -403,3 +403,216 @@ def merge_diagonal_segments_strict(
     }
 
     return final_lines, stats, cats
+
+Great — now you’re at the semantic geometry stage, not just detection 👍
+Let’s do this cleanly, deterministically, and CAD-correct.
+Below is a robust implementation + explanation that does exactly what you described.
+🎯 Goal (rephrased precisely)
+Given:
+detected arrowheads (triangle vertices + tip)
+detected arcs / circles
+detected final straight lines (HV + merged diagonals)
+We want to:
+Extract dimension lines
+→ lines connected to the base of the arrowhead
+Classify what the arrowhead points to
+arc / circle → dimension refers to that entity
+straight/diagonal line → that line is an extension line
+Separate dimension geometry from entity geometry
+🧠 Key geometric ideas (important)
+Arrowhead geometry
+An arrowhead has:
+tip → points toward the measured entity
+base → opposite side of the triangle (2 vertices)
+📌 Dimension line always connects to the base, not the tip
+📌 Entity connection is always at the tip
+This is exactly how mechanical drawings work.
+✅ Pipeline (final, correct)
+Copy code
+
+for each arrowhead:
+    1) find base midpoint
+    2) find lines connected to base → dimension lines
+    3) find what the tip touches:
+         - arc/circle → entity = that
+         - straight line → extension line
+✅ Helper geometry utilities
+Copy code
+Python
+import numpy as np
+
+def dist_point_to_segment(p, a, b):
+    """Distance from point p to segment a-b"""
+    ab = b - a
+    if np.dot(ab, ab) < 1e-6:
+        return np.linalg.norm(p - a)
+    t = np.dot(p - a, ab) / np.dot(ab, ab)
+    t = np.clip(t, 0, 1)
+    proj = a + t * ab
+    return np.linalg.norm(p - proj)
+
+
+def midpoint(p, q):
+    return 0.5 * (p + q)
+✅ Step 1: compute arrowhead base midpoint
+Copy code
+Python
+def arrowhead_base_midpoint(arrow):
+    """
+    arrow["vertices"] : list of 3 points
+    arrow["tip"]      : sharp vertex
+    """
+    verts = [np.array(v, dtype=np.float32) for v in arrow["vertices"]]
+    tip = np.array(arrow["tip"], dtype=np.float32)
+
+    base_pts = [v for v in verts if np.linalg.norm(v - tip) > 1e-3]
+    return midpoint(base_pts[0], base_pts[1])
+✅ Step 2: find dimension lines (connected to arrow base)
+Copy code
+Python
+def find_dimension_lines(
+    arrow,
+    lines,
+    connect_tol=3.0
+):
+    """
+    Returns lines connected to arrowhead base
+    """
+    base_mid = arrowhead_base_midpoint(arrow)
+    dim_lines = []
+
+    for p1, p2 in lines:
+        if (
+            dist_point_to_segment(base_mid, p1, p2) <= connect_tol
+        ):
+            dim_lines.append((p1, p2))
+
+    return dim_lines
+📌 These are dimension lines
+📌 Remove them from the geometry pool later
+✅ Step 3: determine what the arrowhead tip points to
+Check against arcs & circles FIRST (priority)
+Copy code
+Python
+def tip_hits_circle(tip, circle, tol=2.5):
+    c = np.array(circle["center"], dtype=np.float32)
+    r = circle["radius"]
+    return abs(np.linalg.norm(tip - c) - r) <= tol
+
+
+def tip_hits_arc(tip, arc, tol=2.5):
+    pts = arc["points"]
+    dists = np.linalg.norm(pts - tip, axis=1)
+    return np.min(dists) <= tol
+Check against straight / diagonal lines (extension line)
+Copy code
+Python
+def tip_hits_line(tip, line, tol=2.5):
+    p1, p2 = line
+    return dist_point_to_segment(tip, p1, p2) <= tol
+✅ Step 4: classify arrowhead target
+Copy code
+Python
+def classify_arrowhead_target(
+    arrow,
+    arcs,
+    circles,
+    lines,
+    tol=2.5
+):
+    tip = np.array(arrow["tip"], dtype=np.float32)
+
+    # 1️⃣ Arc / circle → entity
+    for c in circles:
+        if tip_hits_circle(tip, c, tol):
+            return {
+                "type": "circle",
+                "entity": c
+            }
+
+    for a in arcs:
+        if tip_hits_arc(tip, a, tol):
+            return {
+                "type": "arc",
+                "entity": a
+            }
+
+    # 2️⃣ Line → extension line
+    for ln in lines:
+        if tip_hits_line(tip, ln, tol):
+            return {
+                "type": "extension_line",
+                "entity": ln
+            }
+
+    return {
+        "type": "unknown",
+        "entity": None
+    }
+✅ Step 5: full dimension extraction
+Copy code
+Python
+def extract_dimensions(
+    arrowheads,
+    lines,
+    arcs,
+    circles,
+    connect_tol=3.0,
+    tip_tol=2.5
+):
+    dimensions = []
+
+    for arrow in arrowheads:
+        dim_lines = find_dimension_lines(
+            arrow,
+            lines,
+            connect_tol=connect_tol
+        )
+
+        target = classify_arrowhead_target(
+            arrow,
+            arcs,
+            circles,
+            lines,
+            tol=tip_tol
+        )
+
+        dimensions.append({
+            "arrowhead": arrow,
+            "dimension_lines": dim_lines,
+            "target_type": target["type"],
+            "target_entity": target["entity"]
+        })
+
+    return dimensions
+✅ What you get (clean separation)
+For each dimension:
+Copy code
+Python
+{
+  "arrowhead": {...},
+  "dimension_lines": [ (p1,p2), ... ],
+  "target_type": "circle" | "arc" | "extension_line" | "unknown",
+  "target_entity": <geometry object>
+}
+Now you can:
+❌ remove dimension_lines from geometry
+❌ remove arrowhead triangles
+✅ keep only real part geometry
+✅ associate dimensions to entities
+🎯 Why this works (important)
+✔ Uses base of arrowhead (correct drafting logic)
+✔ Uses tip direction semantics
+✔ Distinguishes entity vs extension line
+✔ Robust to diagonal / merged lines
+✔ Independent of OCR (good design)
+🚀 Next logical steps (recommended)
+Pair two arrowheads → one dimension
+Order arrowheads by dimension line direction
+Attach OCR text later
+Export clean CAD-like JSON or DXF
+If you want, next I can:
+add visual debug overlay (colored arrowhead → entity → dim lines)
+handle dual-arrow dimensions
+generate dimension objects (length, orientation)
+Just tell me the next step.
