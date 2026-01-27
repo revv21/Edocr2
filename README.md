@@ -182,3 +182,134 @@ def annotate_dimensions(input_pdf, output_pdf):
 # annotate_dimensions("engineering_drawing.pdf", "annotated_drawing.pdf")
 
 
+import numpy as np
+from PIL import Image, ImageDraw
+from svgpathtools import svg2paths2, Line
+import math
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def complex_to_xy(z):
+    return np.array([float(z.real), float(z.imag)], dtype=np.float32)
+
+def seg_length(p1, p2):
+    return float(np.linalg.norm(p2 - p1))
+
+
+# -----------------------------
+# Extract SVG line segments (indexed)
+# -----------------------------
+def extract_svg_lines(svg_path):
+    paths, _, _ = svg2paths2(svg_path)
+    segments = []
+
+    for path in paths:
+        for seg in path:
+            if isinstance(seg, Line):
+                p1 = complex_to_xy(seg.start)
+                p2 = complex_to_xy(seg.end)
+                if seg_length(p1, p2) > 1e-6:
+                    segments.append((p1, p2))
+
+    return segments
+
+
+# -----------------------------
+# Preview long lines only
+# -----------------------------
+def preview_long_lines(
+    all_segments,
+    removed_ids,
+    min_len=30.0,
+    out_path="long_lines_after_removal.png",
+    size=2000,
+    pad=30
+):
+    # Keep only remaining segments
+    remaining = [
+        (p1, p2)
+        for sid, (p1, p2) in enumerate(all_segments)
+        if sid not in removed_ids
+    ]
+
+    # Filter long ones
+    long_lines = [
+        (p1, p2)
+        for (p1, p2) in remaining
+        if seg_length(p1, p2) >= min_len
+    ]
+
+    print("Total segments           :", len(all_segments))
+    print("Removed (arc/arrow)      :", len(removed_ids))
+    print("Remaining segments       :", len(remaining))
+    print("Long lines (kept)        :", len(long_lines))
+
+    if not long_lines:
+        print("⚠️ No long lines found — try reducing min_len")
+        return
+
+    # Bounds
+    pts = []
+    for p1, p2 in long_lines:
+        pts.append(p1); pts.append(p2)
+    pts = np.asarray(pts, dtype=np.float32)
+
+    minx, miny = float(pts[:, 0].min()), float(pts[:, 1].min())
+    maxx, maxy = float(pts[:, 0].max()), float(pts[:, 1].max())
+    w = maxx - minx
+    h = maxy - miny
+
+    scale = min((size - 2 * pad) / (w + 1e-6),
+                (size - 2 * pad) / (h + 1e-6))
+
+    def map_pt(p):
+        return (
+            pad + (p[0] - minx) * scale,
+            pad + (p[1] - miny) * scale
+        )
+
+    img = Image.new("RGB", (size, size), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    # Draw all remaining segments faint (context)
+    for p1, p2 in remaining:
+        x1, y1 = map_pt(p1)
+        x2, y2 = map_pt(p2)
+        draw.line((x1, y1, x2, y2), fill=(220, 220, 220), width=1)
+
+    # Draw long lines bold
+    for p1, p2 in long_lines:
+        x1, y1 = map_pt(p1)
+        x2, y2 = map_pt(p2)
+        draw.line((x1, y1, x2, y2), fill=(0, 0, 0), width=3)
+
+    img.save(out_path)
+    print(f"✅ Saved preview: {out_path}")
+
+
+# -----------------------------
+# Main
+# -----------------------------
+if __name__ == "__main__":
+    svg_file = "input/drawing.svg"
+
+    # 1) Extract all segments
+    segments = extract_svg_lines(svg_file)
+
+    # 2) Get used IDs from YOUR working detectors
+    # Replace these with actual outputs
+    used_arc_circle_ids = set()   # from arc/circle detection
+    used_arrow_ids = set()        # from arrowhead detection
+
+    removed_ids = used_arc_circle_ids.union(used_arrow_ids)
+
+    # 3) Preview long lines only
+    preview_long_lines(
+        all_segments=segments,
+        removed_ids=removed_ids,
+        min_len=30.0,   # 🔧 tune this
+        out_path="long_lines_after_removal.png"
+    )
+
