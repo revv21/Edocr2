@@ -94,4 +94,53 @@ If you want, I can integrate this into your full pipeline and output:
 final_lines.json
 final_lines_preview.png
 
-https://smailiitmacin-my.sharepoint.com/:u:/g/personal/ed22b063_smail_iitm_ac_in/IQBsDueESb-ASqrfZY3A7Z1nAa9IaMW0rY2x63G4LNe6ljA?e=E59w4E
+import cv2
+import numpy as np
+
+def process_drawing(image_path):
+    # 1. Load image and convert to Grayscale
+    img = cv2.imread(image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 2. Invert and Threshold (Assuming dark lines on light background)
+    # We want white lines on a black background for processing
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+
+    # 3. Clean up noise (Morphology)
+    # This helps remove small text pixels while keeping long lines
+    kernel = np.ones((3,3), np.uint8)
+    clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+    # 4. Extract Lines (Probabilistic Hough Transform)
+    # minLineLength: ignores short segments (like parts of letters)
+    # maxLineGap: bridges small gaps in the raster line
+    lines = cv2.HoughLinesP(clean, 1, np.pi/180, threshold=50, 
+                            minLineLength=100, maxLineGap=10)
+
+    # 5. Extract Circles
+    # dp: inverse ratio of resolution
+    # minDist: distance between centers to avoid double-detecting
+    circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=50,
+                               param1=50, param2=30, minRadius=10, maxRadius=200)
+
+    # Visualization
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(img, (x1, y1), (x2, y2), (0, 255, 0), 2) # Green for lines
+
+    if circles is not None:
+        circles = np.uint16(np.around(circles))
+        for i in circles[0, :]:
+            cv2.circle(img, (i[0], i[1]), i[2], (255, 0, 0), 2) # Blue for circles
+
+    cv2.imshow('Detected Entities', img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+# Run the function
+# process_drawing('your_drawing.png')
+
+
+
+
