@@ -152,5 +152,33 @@ vtracer.convert_image_to_svg_py(
     iteration_limit=10
 )
 
+import fitz  # PyMuPDF
+
+def annotate_dimensions(input_pdf, output_pdf):
+    doc = fitz.open(input_pdf)
+    
+    for page in doc:
+        # 1. Extract words and their bounding boxes
+        words = page.get_text("words") 
+        
+        for w in words:
+            # Coordinates of the word bounding box
+            rect = fitz.Rect(w[:4]) 
+            text_value = w[4]
+            
+            # 2. Draw a rectangle annotation around the dimension
+            annot = page.add_rect_annot(rect)
+            annot.set_colors(stroke=(0, 1, 0))  # Green border
+            annot.update()
+            
+            # 3. (Optional) Add a "sticky note" or text label next to it
+            # This is useful for your 'Checker' to report mistakes
+            page.insert_text((rect.x0, rect.y1 + 10), f"Dim: {text_value}", 
+                             fontsize=8, color=(1, 0, 0))
+            
+    doc.save(output_pdf)
+    doc.close()
+
+# annotate_dimensions("engineering_drawing.pdf", "annotated_drawing.pdf")
 
 
