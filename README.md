@@ -141,6 +141,16 @@ def process_drawing(image_path):
 # Run the function
 # process_drawing('your_drawing.png')
 
+import vtracer
+
+# This converts your noisy image into a clean SVG file
+vtracer.convert_image_to_svg_py(
+    "input_drawing.png", 
+    "output_drawing.svg",
+    mode="spline",      # Better for curves and engineering lines
+    clustering=True,    # Helps group related pixels
+    iteration_limit=10
+)
 
 
 
