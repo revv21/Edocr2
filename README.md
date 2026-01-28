@@ -209,3 +209,188 @@ Compute dimension direction & span
 Attach OCR text later
 Export dimension objects (JSON / DXF)
 If you want, I can help with pairing arrowheads into a single dimension next.
+
+
+Yes 👍 — this is the right cleanup step.
+Below is exact code that:
+Removes
+dimension lines (from arrowhead base)
+leader / extension lines (arrowhead tip → straight line)
+arrowheads themselves
+Keeps
+real part geometry: straight edges, merged diagonals, arcs, circles
+Shows a clean preview of only the remaining geometry
+This is exactly what you want before exporting CAD geometry or matching entities.
+🎯 What will be removed
+From your already-extracted dimensions:
+dimension_lines
+target_entity if target_type == "extension_line"
+arrowhead triangles (not drawn at all)
+✅ Step 1: Utility – segment equality check
+We need a tolerant way to remove lines.
+Copy code
+Python
+import numpy as np
+
+def same_segment(seg1, seg2, tol=1e-3):
+    (a1, a2), (b1, b2) = seg1, seg2
+    return (
+        (np.linalg.norm(a1 - b1) < tol and np.linalg.norm(a2 - b2) < tol) or
+        (np.linalg.norm(a1 - b2) < tol and np.linalg.norm(a2 - b1) < tol)
+    )
+✅ Step 2: Collect all lines to remove
+Copy code
+Python
+def collect_dimension_and_leader_lines(dimensions):
+    remove = []
+
+    for dim in dimensions:
+        # dimension lines
+        for ln in dim["dimension_lines"]:
+            remove.append(ln)
+
+        # extension / leader line
+        if dim["target_type"] == "extension_line":
+            remove.append(dim["target_entity"])
+
+    return remove
+✅ Step 3: Remove them from geometry
+Copy code
+Python
+def remove_lines_from_geometry(
+    all_lines,
+    lines_to_remove,
+    tol=1e-3
+):
+    kept = []
+
+    for ln in all_lines:
+        discard = False
+        for rem in lines_to_remove:
+            if same_segment(ln, rem, tol):
+                discard = True
+                break
+        if not discard:
+            kept.append(ln)
+
+    return kept
+✅ Step 4: Render remaining geometry only
+This preview shows only real part geometry.
+Color scheme
+Black → straight / diagonal part edges
+Blue → arcs
+Green → circles
+Copy code
+Python
+from PIL import Image, ImageDraw
+
+def render_remaining_geometry_preview(
+    lines,
+    arcs,
+    circles,
+    out_path="remaining_geometry_preview.png",
+    size=2000,
+    pad=30
+):
+    # -----------------------------
+    # Bounds
+    # -----------------------------
+    pts = []
+    for p1, p2 in lines:
+        pts.append(p1); pts.append(p2)
+    for a in arcs:
+        pts.extend(a["points"])
+    for c in circles:
+        cx, cy = c["center"]
+        pts.append(np.array([cx + c["radius"], cy]))
+        pts.append(np.array([cx - c["radius"], cy]))
+
+    pts = np.asarray(pts, dtype=np.float32)
+    minx, miny = float(pts[:, 0].min()), float(pts[:, 1].min())
+    maxx, maxy = float(pts[:, 0].max()), float(pts[:, 1].max())
+
+    w = maxx - minx
+    h = maxy - miny
+    scale = min(
+        (size - 2 * pad) / (w + 1e-6),
+        (size - 2 * pad) / (h + 1e-6)
+    )
+
+    def map_pt(p):
+        return (
+            pad + (p[0] - minx) * scale,
+            pad + (p[1] - miny) * scale
+        )
+
+    img = Image.new("RGB", (size, size), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    # -----------------------------
+    # Draw part geometry
+    # -----------------------------
+    for p1, p2 in lines:
+        draw.line((*map_pt(p1), *map_pt(p2)),
+                  fill=(0, 0, 0), width=2)
+
+    for a in arcs:
+        pts2 = [map_pt(p) for p in a["points"]]
+        draw.line(pts2, fill=(0, 0, 255), width=3)
+
+    for c in circles:
+        cx, cy = c["center"]
+        r = c["radius"]
+        C = np.array([cx, cy])
+        CX, CY = map_pt(C)
+        R = r * scale
+        draw.ellipse(
+            (CX - R, CY - R, CX + R, CY + R),
+            outline=(0, 180, 0),
+            width=3
+        )
+
+    img.save(out_path)
+    print(f"✅ Saved remaining geometry → {out_path}")
+✅ Step 5: Put it together (exact usage)
+Copy code
+Python
+# 1) extract dimensions (you already have this)
+dimensions = extract_dimensions(
+    arrowheads=arrowheads,
+    lines=final_lines,
+    arcs=arcs,
+    circles=circles
+)
+
+# 2) collect all dimension + leader lines
+remove_lines = collect_dimension_and_leader_lines(dimensions)
+
+print("Removing lines:", len(remove_lines))
+
+# 3) remove them from geometry
+clean_lines = remove_lines_from_geometry(
+    final_lines,
+    remove_lines
+)
+
+print("Remaining part lines:", len(clean_lines))
+
+# 4) preview clean part geometry
+render_remaining_geometry_preview(
+    lines=clean_lines,
+    arcs=arcs,
+    circles=circles,
+    out_path="remaining_geometry_preview.png"
+)
+✅ What “correct” output should look like
+✔ No arrowheads
+✔ No dimension baselines
+✔ No extension / leader lines
+✔ Only true part edges + arcs + circles
+This image should look like a dimension-free mechanical drawing.
+🚀 Next logical steps (optional)
+You are now very close to a true CAD reconstruction:
+Export clean_lines + arcs + circles → DXF
+Compute topology (vertex graph)
+Match dimensions to entities (already mostly done)
+Attach OCR later
+If you want, I can help you export this to DXF next.
