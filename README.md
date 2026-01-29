@@ -130,3 +130,30 @@ This is a pure bug fix in removal.
 If the output still shows leader lines after this, then the only remaining possibility is:
 the line you think is a “leader” was actually classified as a dimension line (base-connected), not extension_line
 If that happens, we can debug one arrowhead case visually and tune connect_tol / tip_tol — but the logic stays exactly yours.
+
+import math
+
+EPS_T = 0.005  # same as paper
+
+def match_front_bottom(ef, eb):
+    # shared axis: X
+    xf_u, xf_l = extent(ef["points"], "x")
+    xb_u, xb_l = extent(eb["points"], "x")
+
+    return math.sqrt((xf_u - xb_u)**2 + (xf_l - xb_l)**2) < EPS_T
+
+
+def match_front_left(ef, el):
+    # shared axis: Y
+    yf_u, yf_l = extent(ef["points"], "y")
+    yl_u, yl_l = extent(el["points"], "y")
+
+    return math.sqrt((yf_u - yl_u)**2 + (yf_l - yl_l)**2) < EPS_T
+
+
+def match_bottom_left(eb, el):
+    # shared axis: Z
+    zb_u, zb_l = extent(eb["points"], "y")   # y == z in bottom view
+    zl_u, zl_l = extent(el["points"], "x")   # x == z in left view
+
+    return math.sqrt((zb_u - zl_u)**2 + (zb_l - zl_l)**2) < EPS_T
