@@ -157,3 +157,6 @@ def match_bottom_left(eb, el):
     zl_u, zl_l = extent(el["points"], "x")   # x == z in left view
 
     return math.sqrt((zb_u - zl_u)**2 + (zb_l - zl_l)**2) < EPS_T
+
+
+Hi Gopal - all good; how about you? This one: https://coezet.iitm.ac.in/view_pdf.html?file=pdf/reports/FMEA-report-Mar_25_CoEZET-Final-Publication.pdf&title=Failure%20Modes%20and%20Effects%20Analysis%20(FMEA)%20for%20Battery%20Electric%20Trucks?
