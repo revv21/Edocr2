@@ -3,59 +3,59 @@ flowchart TD
 %% =====================
 %% INPUT LAYER
 %% =====================
-A[Product Schematic\nParts & Subparts] --> B
-A1[Function Definitions\nper Part] --> B
-A2[Interfaces\nMechanical / Electrical / Fluid] --> B
-A3[Manufacturing Process\n(Optional)] --> B
-A4[Test Coverage Data\n(Optional)] --> B
+A[Product Schematic\nParts and Subparts] --> B
+A1[Function Definitions\nPer Part] --> B
+A2[Interfaces\nMechanical Electrical Fluid] --> B
+A3[Manufacturing Process\nOptional] --> B
+A4[Test Coverage Data\nOptional] --> B
 
 %% =====================
 %% DATA MODEL
 %% =====================
-B[System Graph Builder\n(Parts–Functions–Interfaces)] --> C
+B[System Graph Builder\nParts Functions Interfaces] --> C
 
-C[(Knowledge Graph\nPart ↔ Function ↔ Interface)] --> D
+C[Knowledge Graph\nPart Function Interface] --> D
 C --> E
 
 %% =====================
 %% FAILURE MODE GENERATION
 %% =====================
-D[Rule Engine\n(Function Negation,\nTemplates)] --> F
-E[AI Engine\n(LLM + RAG)] --> F
+D[Rule Engine\nFunction Negation Templates] --> F
+E[AI Engine\nLLM and RAG] --> F
 
-F[Candidate Failure Modes\nper Function] --> G
+F[Candidate Failure Modes\nPer Function] --> G
 
 %% =====================
 %% EFFECT PROPAGATION
 %% =====================
-G --> H[Effect Propagation Engine\n(Graph Traversal)]
+G --> H[Effect Propagation Engine]
 H --> I[Local Effects]
 H --> J[Subsystem Effects]
-H --> K[System / User Effects]
+H --> K[System User Effects]
 
 %% =====================
 %% SCORING
 %% =====================
-K --> L[Severity Assignment\n(Rules + Standards)]
-G --> M[Cause Inference Engine\n(Part Type + Process)]
-M --> N[Occurrence Estimation\n(Priors / Data)]
-A4 --> O[Detection Estimation\n(Test Coverage)]
+K --> L[Severity Assignment\nStandards Based]
+G --> M[Cause Inference Engine]
+M --> N[Occurrence Estimation]
+A4 --> O[Detection Estimation]
 
 L --> P
 N --> P
 O --> P
 
-P[Risk Scoring\n(S / O / D → RPN)] --> Q
+P[Risk Scoring\nS O D to RPN] --> Q
 
 %% =====================
 %% DFMEA OUTPUT
 %% =====================
-Q[DFMEA Item Generator] --> R[DFMEA Table\n(Function, FM, Effect, Cause,\nS/O/D, RPN)]
+Q[DFMEA Item Generator] --> R[DFMEA Table]
 
 %% =====================
 %% HUMAN LOOP
 %% =====================
-R --> S[Engineer Review & Edit]
+R --> S[Engineer Review]
 S -->|Accepted| T[Approved DFMEA]
 S -->|Modified| C
 
@@ -63,14 +63,14 @@ S -->|Modified| C
 %% FTA GENERATION
 %% =====================
 T --> U[Fault Tree Builder]
-U --> V[Top Event\n(System Failure)]
-U --> W[Intermediate Events\n(Failure Modes)]
-U --> X[Basic Events\n(Causes)]
-V --> Y[Fault Tree Diagram\nAND / OR Gates]
+U --> V[Top Event]
+U --> W[Intermediate Events]
+U --> X[Basic Events]
+V --> Y[Fault Tree Diagram]
 
 %% =====================
 %% LEARNING LOOP
 %% =====================
 S --> Z[Feedback Store]
-Z --> E
 Z --> D
+Z --> E
