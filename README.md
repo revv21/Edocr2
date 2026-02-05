@@ -1,162 +1,76 @@
-Got it 👍 — thanks for the clarification.
-We’ll strictly stick to the logic YOU defined earlier, no graph traversal, no new assumptions.
-Let me restate your logic clearly and then give corrected code that follows it exactly.
-✅ Your logic (unchanged)
-For each arrowhead:
-Dimension lines
-→ lines connected to the base of the arrowhead triangle
-Leader / extension line
-→ ONLY IF the arrowhead tip is connected directly to a straight or diagonal line
-→ that connected line is the leader/extension line
-If arrowhead tip hits arc/circle
-→ NO leader line (dimension refers directly to entity)
-So:
-❌ No chain walking
-❌ No BFS / graph logic
-❌ No “multiple leader segments”
-✅ Only what your earlier extract_dimensions() already classified
-🔴 Why leader lines were not removed earlier (real bug)
-The issue was not logic, it was implementation detail:
-dimension["target_entity"] is the leader line
-but removal was done by segment equality
-and your final_lines list contains merged / normalized segments
-while target_entity might be a different object instance (same geometry, different reference)
-So the line was logically identified, but not removed correctly.
-✅ Correct fix (using YOUR logic)
-Key idea
-👉 Remove leader lines by geometric proximity, not object identity.
-✅ Step 1: helper – geometric line match (robust)
-Copy code
-Python
-import numpy as np
+flowchart TD
 
-def line_matches(line, target, tol=1e-3):
-    """
-    Check if two line segments represent the same geometry
-    (order-independent)
-    """
-    (a1, a2) = line
-    (b1, b2) = target
+%% =====================
+%% INPUT LAYER
+%% =====================
+A[Product Schematic\nParts & Subparts] --> B
+A1[Function Definitions\nper Part] --> B
+A2[Interfaces\nMechanical / Electrical / Fluid] --> B
+A3[Manufacturing Process\n(Optional)] --> B
+A4[Test Coverage Data\n(Optional)] --> B
 
-    return (
-        (np.linalg.norm(a1 - b1) < tol and np.linalg.norm(a2 - b2) < tol) or
-        (np.linalg.norm(a1 - b2) < tol and np.linalg.norm(a2 - b1) < tol)
-    )
-✅ Step 2: collect lines to remove (dimension + leader)
-Copy code
-Python
-def collect_lines_to_remove_from_dimensions(dimensions):
-    """
-    Uses ONLY your original logic
-    """
-    remove_lines = []
+%% =====================
+%% DATA MODEL
+%% =====================
+B[System Graph Builder\n(Parts–Functions–Interfaces)] --> C
 
-    for dim in dimensions:
-        # 1) dimension lines (base-connected)
-        for ln in dim["dimension_lines"]:
-            remove_lines.append(ln)
+C[(Knowledge Graph\nPart ↔ Function ↔ Interface)] --> D
+C --> E
 
-        # 2) leader / extension line (tip-connected to straight line)
-        if dim["target_type"] == "extension_line":
-            remove_lines.append(dim["target_entity"])
+%% =====================
+%% FAILURE MODE GENERATION
+%% =====================
+D[Rule Engine\n(Function Negation,\nTemplates)] --> F
+E[AI Engine\n(LLM + RAG)] --> F
 
-    return remove_lines
-✅ Step 3: remove them from final geometry
-Copy code
-Python
-def remove_dimension_and_leader_lines_simple(
-    final_lines,
-    dimensions,
-    tol=1e-3
-):
-    lines_to_remove = collect_lines_to_remove_from_dimensions(dimensions)
+F[Candidate Failure Modes\nper Function] --> G
 
-    cleaned = []
-    for ln in final_lines:
-        should_remove = False
-        for rem in lines_to_remove:
-            if line_matches(ln, rem, tol):
-                should_remove = True
-                break
-        if not should_remove:
-            cleaned.append(ln)
+%% =====================
+%% EFFECT PROPAGATION
+%% =====================
+G --> H[Effect Propagation Engine\n(Graph Traversal)]
+H --> I[Local Effects]
+H --> J[Subsystem Effects]
+H --> K[System / User Effects]
 
-    return cleaned
-✅ Step 4: render remaining geometry (unchanged)
-Use the same renderer you already have:
-Copy code
-Python
-render_remaining_geometry_preview(
-    lines=clean_lines,
-    arcs=arcs,
-    circles=circles,
-    out_path="remaining_geometry_preview.png"
-)
-✅ Correct usage (full snippet)
-Copy code
-Python
-# dimensions already extracted using YOUR logic
-dimensions = extract_dimensions(
-    arrowheads=arrowheads,
-    lines=final_lines,
-    arcs=arcs,
-    circles=circles
-)
+%% =====================
+%% SCORING
+%% =====================
+K --> L[Severity Assignment\n(Rules + Standards)]
+G --> M[Cause Inference Engine\n(Part Type + Process)]
+M --> N[Occurrence Estimation\n(Priors / Data)]
+A4 --> O[Detection Estimation\n(Test Coverage)]
 
-# remove dimension + leader lines (simple logic)
-clean_lines = remove_dimension_and_leader_lines_simple(
-    final_lines,
-    dimensions,
-    tol=1e-3
-)
+L --> P
+N --> P
+O --> P
 
-print("Before:", len(final_lines))
-print("After :", len(clean_lines))
+P[Risk Scoring\n(S / O / D → RPN)] --> Q
 
-render_remaining_geometry_preview(
-    lines=clean_lines,
-    arcs=arcs,
-    circles=circles,
-    out_path="remaining_geometry_preview.png"
-)
-✅ What you should see now
-✔ Dimension baselines gone
-✔ Extension / leader lines gone
-✔ Arrowheads gone (already not drawn)
-✔ Only true part geometry remains
-And importantly:
-No new logic was introduced.
-This is a pure bug fix in removal.
-If the output still shows leader lines after this, then the only remaining possibility is:
-the line you think is a “leader” was actually classified as a dimension line (base-connected), not extension_line
-If that happens, we can debug one arrowhead case visually and tune connect_tol / tip_tol — but the logic stays exactly yours.
+%% =====================
+%% DFMEA OUTPUT
+%% =====================
+Q[DFMEA Item Generator] --> R[DFMEA Table\n(Function, FM, Effect, Cause,\nS/O/D, RPN)]
 
-import math
+%% =====================
+%% HUMAN LOOP
+%% =====================
+R --> S[Engineer Review & Edit]
+S -->|Accepted| T[Approved DFMEA]
+S -->|Modified| C
 
-EPS_T = 0.005  # same as paper
+%% =====================
+%% FTA GENERATION
+%% =====================
+T --> U[Fault Tree Builder]
+U --> V[Top Event\n(System Failure)]
+U --> W[Intermediate Events\n(Failure Modes)]
+U --> X[Basic Events\n(Causes)]
+V --> Y[Fault Tree Diagram\nAND / OR Gates]
 
-def match_front_bottom(ef, eb):
-    # shared axis: X
-    xf_u, xf_l = extent(ef["points"], "x")
-    xb_u, xb_l = extent(eb["points"], "x")
-
-    return math.sqrt((xf_u - xb_u)**2 + (xf_l - xb_l)**2) < EPS_T
-
-
-def match_front_left(ef, el):
-    # shared axis: Y
-    yf_u, yf_l = extent(ef["points"], "y")
-    yl_u, yl_l = extent(el["points"], "y")
-
-    return math.sqrt((yf_u - yl_u)**2 + (yf_l - yl_l)**2) < EPS_T
-
-
-def match_bottom_left(eb, el):
-    # shared axis: Z
-    zb_u, zb_l = extent(eb["points"], "y")   # y == z in bottom view
-    zl_u, zl_l = extent(el["points"], "x")   # x == z in left view
-
-    return math.sqrt((zb_u - zl_u)**2 + (zb_l - zl_l)**2) < EPS_T
-
-
-Hi Gopal - all good; how about you? This one: https://coezet.iitm.ac.in/view_pdf.html?file=pdf/reports/FMEA-report-Mar_25_CoEZET-Final-Publication.pdf&title=Failure%20Modes%20and%20Effects%20Analysis%20(FMEA)%20for%20Battery%20Electric%20Trucks?
+%% =====================
+%% LEARNING LOOP
+%% =====================
+S --> Z[Feedback Store]
+Z --> E
+Z --> D
