@@ -1,34 +1,22 @@
 flowchart TD
-    USER([User]) --> FASTAPI[FastAPI Gateway]
-    FASTAPI --> SUPERVISOR{LangGraph Supervisor}
+    IN([Input: Component + Case]) --> ROUTER
 
-    SUPERVISOR -->|rag| RAG
-    SUPERVISOR -->|dfmea| DFMEA
-    SUPERVISOR -->|optimize| OPT
+    ROUTER{Case Type?}
+    ROUTER -->|new design| RAG_CTX
+    ROUTER -->|new environment| PARSE
+    ROUTER -->|design change| PARSE
 
-    subgraph RAG [RAG Agent]
-        R1[Retrieve Docs] --> R2[Grade Relevance]
-        R2 -->|low confidence| R1
-        R2 -->|sufficient| R3[Generate Answer]
-    end
+    PARSE[Parse Existing DFMEA\nxlsx import] --> RAG_CTX
 
-    subgraph DFMEA [DFMEA Agent]
-        D1[Route Case] --> D2[RAG Context]
-        D2 --> D3[Generate DFMEA Steps]
-        D3 --> D4[Rate Risks & Export]
-    end
+    RAG_CTX[RAG Context Retrieval\nknown failures · historical ratings]
 
-    subgraph OPT [Optimiser Agent]
-        O1[Solve ODE] --> O2[Compute RMS]
-        O2 --> O3{Converged?}
-        O3 -->|no| O1
-        O3 -->|yes| O4[Summarise Result]
-    end
+    RAG_CTX --> EL[Generate System Elements\nStep 1 — component hierarchy]
+    EL --> FN[Generate Functions\nStep 4 — verb + noun format]
+    FN --> FM[Generate Failure Modes & Effects\nStep 7 — severity S]
+    FM --> FC[Generate Failure Causes\nStep 8 — occurrence O · detection D]
+    FC --> RISK[Rate Action Priority\nStep 9 — H / M / L per AIAG-VDA 2019]
+    RISK --> EXPORT[Assemble & Export\nformatted xlsx]
+    EXPORT --> OUT([Output: DFMEA File])
 
-    RAG & DFMEA & OPT -.-> INFRA
-
-    subgraph INFRA [AWS Bedrock + FAISS]
-        Claude[Claude Sonnet]
-        Titan[Titan Embeddings]
-        VectorStore[FAISS Vector Store]
-    end
+    RAG_CTX -.->|context injected into\nall generation steps| FM
+    RAG_CTX -.-> FC
