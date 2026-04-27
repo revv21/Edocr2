@@ -1,128 +1,127 @@
-7const updateIfmeaFocusFn = (id: string, focusFnId: string) => {
-  const ff = focusFunctions.find(f => f.id === focusFnId);
-  setIfmeaInterfaces(p => p.map(i =>
-    i.id !== id ? i : { ...i, focusFnId, focusFn: ff?.name ?? "" }
-  ));
-};// Get the DFMEA failure modes for this interface's focus function
-const dfmeaModes = Array.from(modesByFocus[iface.focusFnId]?.selected ?? []);
-if (!dfmeaModes.length || !iface.nominalTransfer.trim() || !iface.focusFnId) continue;
-// ...
-body: JSON.stringify({
-  from_element:        iface.fromElement,
-  to_element:          iface.toElement,
-  connection_type:     iface.connType,
-  nominal_transfer:    iface.nominalTransfer,
-  focus_function:      iface.focusFn,
-  dfmea_failure_modes: dfmeaModes,       // renamed field, new backend expects this
-  noise_factors:       cleanNoise,
-}),body: JSON.stringify({
-  rows: draft.map(row => ({
-    row_id:           row.id,
-    from_element:     row.from_element,
-    to_element:       row.to_element,
-    connection_type:  row.conn_type,
-    nominal_transfer: row.nominal_transfer,
-    failure_mode:     row.failure_mode,
-    interface_cause:  row.failure_cause,  // add this line
-  })),
-}),{ifmeaPhase === "modes" && (
-  <div className="space-y-4">
-    <p className="text-xs text-muted-foreground">
-      For each interface, describe what is transferred and select which focus
-      function it relates to. The DFMEA failure modes for that function will
-      be used as the interface failure modes — no separate generation needed.
-    </p>
-    {ifmeaInterfaces.map(iface => {
-      const meta = CONN_META[iface.connType];
-      const dfmeaModes = Array.from(modesByFocus[iface.focusFnId]?.selected ?? []);
-      return (
-        <Card key={iface.id} className="border">
-          <CardContent className="p-4 space-y-3">
-            {/* Interface header */}
-            <div className="flex items-center gap-3 flex-wrap">
-              <span className="px-2 py-0.5 rounded text-xs font-bold text-white"
-                style={{ background: meta.color }}>{iface.connType}</span>
-              <span className="font-semibold text-sm">{iface.fromElement}</span>
-              <ArrowRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-              <span className="font-semibold text-sm">{iface.toElement}</span>
-              <span className="text-xs text-muted-foreground">({meta.label})</span>
-              {dfmeaModes.length > 0 && (
-                <Badge variant="default" className="ml-auto">
-                  {dfmeaModes.length} DFMEA modes
-                </Badge>
-              )}
-            </div>
-
-            {/* Nominal transfer */}
-            <div className="space-y-1">
-              <Label className="text-xs font-semibold">
-                What is nominally transferred through this interface?
-              </Label>
-              <Input className="text-sm"
-                placeholder={...} // same placeholders as before
-                value={iface.nominalTransfer}
-                onChange={e => updateIfmeaTransfer(iface.id, e.target.value)} />
-            </div>
-
-            {/* Focus function selector */}
-            <div className="space-y-1.5">
-              <Label className="text-xs font-semibold">
-                Which focus function does this interface support?
-              </Label>
-              <div className="flex flex-wrap gap-2">
-                {focusFunctions.map(ff => (
-                  <button key={ff.id} type="button"
-                    onClick={() => updateIfmeaFocusFn(iface.id, ff.id)}
-                    className={`text-xs px-3 py-1.5 rounded-lg border transition-all ${
-                      iface.focusFnId === ff.id
-                        ? "bg-primary text-primary-foreground border-primary"
-                        : "bg-white text-gray-600 border-gray-300 hover:border-primary/40"
-                    }`}>
-                    {ff.name}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* DFMEA modes — read only, derived from modesByFocus */}
-            {iface.focusFnId && (
-              <div className="space-y-1.5">
-                <Label className="text-xs font-semibold text-muted-foreground">
-                  DFMEA failure modes for this interface (from Step 6)
-                </Label>
-                {dfmeaModes.length === 0 ? (
-                  <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                    No failure modes selected for this function yet. Go to Step 6 and generate modes first.
-                  </p>
-                ) : (
-                  <div className="space-y-1">
-                    {dfmeaModes.map((mode, mi) => (
-                      <div key={mi}
-                        className="flex items-start gap-2 px-3 py-2 rounded-lg bg-primary/5 border border-primary/20 text-sm">
-                        <CheckCircle2 className="h-3.5 w-3.5 text-primary mt-0.5 shrink-0" />
-                        <span className="text-gray-700">{mode}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      );
-    })}
-    <div className="flex justify-end">
-      <Button onClick={() => setIfmeaPhase("causes")}>
-        Next: Generate Causes <ArrowRight className="h-4 w-4 ml-2" />
-      </Button>
-    </div>
-  </div>
-)}if (!iface.focusFnId || !iface.nominalTransfer.trim()) continue;
-const dfmeaModes = Array.from(modesByFocus[iface.focusFnId]?.selected ?? []);
-if (!dfmeaModes.length) continue;
-const updateIfmeaFocusFn = (id: string, focusFnId: string) => {
-  const ff = focusFunctions.find(f => f.id === focusFnId);
-  setIfmeaInterfaces(p => p.map(i =>
-    i.id !== id ? i : { ...i, focusFnId, focusFn: ff?.name ?? "" }
-  ));
+// Select/deselect all causes across every interface group
+const toggleIfmeaSelectAll = () => {
+  const next = !ifmeaSelectAll;
+  setIfmeaSelectAll(next);
+  setIfmeaCauseGroups(p =>
+    p.map(g => ({ ...g, causes: g.causes.map(c => ({ ...c, selected: next })) }))
+  );
 };
+
+// Select/deselect all causes within one group
+const toggleIfmeaGroupSelectAll = (gi: number) => {
+  setIfmeaCauseGroups(p => {
+    const group = p[gi];
+    const allSelected = group.causes.every(c => c.selected);
+    return p.map((g, i) =>
+      i !== gi ? g : { ...g, causes: g.causes.map(c => ({ ...c, selected: !allSelected })) }
+    );
+  });
+};{ifmeaCauseGroups.map((group, gi) => {
+  const sel = group.causes.filter(c => c.selected).length;
+  const allSel = group.causes.length > 0 && group.causes.every(c => c.selected);
+  return (
+    <Collapsible key={gi}
+      title={`${group.fromElement} → ${group.toElement}  |  ${group.failureMode}`}
+      badge={`${sel} / ${group.causes.length}`}
+      badgeVariant={sel > 0 ? "default" : "secondary"}>
+      <div className="space-y-2">
+        {/* Per-group select all */}
+        <div className="flex justify-end">
+          <button type="button"
+            className="text-xs text-primary hover:underline"
+            onClick={() => toggleIfmeaGroupSelectAll(gi)}>
+            {allSel ? "Deselect all" : "Select all in this group"}
+          </button>
+        </div>
+        {!group.causes.length
+          ? <p className="text-sm text-muted-foreground">No causes generated.</p>
+          : group.causes.map(cause => (
+              // ... existing cause label cards unchanged
+            ))
+        }
+      </div>
+    </Collapsible>
+  );
+})}<div className="flex items-center justify-between flex-wrap gap-2">
+  <div className="flex items-center gap-2 text-sm">
+    <Badge variant="outline">{ifmeaTotalSelected} selected</Badge>
+    <span className="text-muted-foreground">across {ifmeaCauseGroups.length} groups</span>
+  </div>
+  <div className="flex items-center gap-2">
+    <Button size="sm" variant="outline" onClick={toggleIfmeaSelectAll}>
+      {ifmeaSelectAll ? "Deselect all" : "Select all"}
+    </Button>
+    <Button size="sm" variant="outline" disabled={ifmeaCausesLoading} onClick={generateIfmeaCauses}>
+      {ifmeaCausesLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : "Regenerate"}
+    </Button>
+  </div>
+</div>
+const [ifmeaAutoRatingLoading, setIfmeaAutoRatingLoading] = useState(false);const autoAssignIfmeaRatings = async () => {
+  setIfmeaAutoRatingLoading(true);
+
+  const payload = ifmeaCauseGroups.flatMap(group =>
+    group.causes
+      .filter(c => c.selected)
+      .map(cause => ({
+        cause_id:           cause.id,
+        cause:              cause.cause,
+        noise_factor:       cause.noise_factor,
+        noise_category:     cause.noise_category,
+        failure_mode:       group.failureMode,
+        focus_function:     group.failureMode,  // interface context
+        focus_element:      group.fromElement,
+        lower_element:      group.fromElement,  // "from" side of the interface
+        lower_function:     group.nominalTransfer, // what the interface transfers
+        prevention_methods: cause.prevention_methods,
+        detection_methods:  cause.detection_methods,
+      }))
+  );
+
+  try {
+    const res = await fetch(`${apiBase}/api/dfmea/auto-rating/bulk`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ causes: payload }),
+    });
+    const data = await res.json();
+
+    const resultMap: Record<string, { occurrence_answer: string; detection_answer: string }> = {};
+    for (const r of data.results ?? []) resultMap[r.cause_id] = r;
+
+    setIfmeaCauseGroups(prev =>
+      prev.map(group => ({
+        ...group,
+        causes: group.causes.map(cause => {
+          const r = resultMap[cause.id];
+          if (!r) return cause;
+          return { ...cause, occurrence_answer: r.occurrence_answer, detection_answer: r.detection_answer };
+        }),
+      }))
+    );
+  } catch (e) {
+    console.error("IFMEA auto-rating failed:", e);
+  } finally {
+    setIfmeaAutoRatingLoading(false);
+  }
+};<div className="flex items-center gap-3 p-3 rounded-lg bg-muted/30 border">
+  <div className="flex-1 h-1.5 bg-border rounded-full overflow-hidden">
+    <div className="h-full bg-primary rounded-full transition-all"
+      style={{ width: ifmeaTotalSelected
+        ? `${(ifmeaTotalRated / ifmeaTotalSelected) * 100}%` : "0%" }} />
+  </div>
+  <span className="text-sm font-medium shrink-0">
+    {ifmeaTotalRated} / {ifmeaTotalSelected} rated
+  </span>
+  {ifmeaTotalRated < ifmeaTotalSelected && (
+    <span className="flex items-center gap-1 text-amber-600 text-xs shrink-0">
+      <AlertTriangle className="h-3 w-3" />Incomplete
+    </span>
+  )}
+  <Button size="sm" variant="outline"
+    disabled={ifmeaAutoRatingLoading || ifmeaTotalSelected === 0}
+    onClick={autoAssignIfmeaRatings}>
+    {ifmeaAutoRatingLoading
+      ? <><Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />Auto-assigning…</>
+      : <><Zap className="h-3.5 w-3.5 mr-1.5" />Auto-assign risk rating</>}
+  </Button>
+</div>
