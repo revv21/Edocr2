@@ -1,4 +1,4 @@
-const updateIfmeaFocusFn = (id: string, focusFnId: string) => {
+7const updateIfmeaFocusFn = (id: string, focusFnId: string) => {
   const ff = focusFunctions.find(f => f.id === focusFnId);
   setIfmeaInterfaces(p => p.map(i =>
     i.id !== id ? i : { ...i, focusFnId, focusFn: ff?.name ?? "" }
@@ -120,3 +120,9 @@ body: JSON.stringify({
 )}if (!iface.focusFnId || !iface.nominalTransfer.trim()) continue;
 const dfmeaModes = Array.from(modesByFocus[iface.focusFnId]?.selected ?? []);
 if (!dfmeaModes.length) continue;
+const updateIfmeaFocusFn = (id: string, focusFnId: string) => {
+  const ff = focusFunctions.find(f => f.id === focusFnId);
+  setIfmeaInterfaces(p => p.map(i =>
+    i.id !== id ? i : { ...i, focusFnId, focusFn: ff?.name ?? "" }
+  ));
+};
