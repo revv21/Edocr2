@@ -1,59 +1,122 @@
-Let me read the current IFMEA step carefully first.
-Now I also need to check the IFMEAInterface type and generateIfmeaCauses handler:
-Now I also need to check how modesByFocus is structured so I know how to pull DFMEA modes per interface:
-I now have the complete picture. Here are all the changes needed, explained precisely.
-Changes needed
-1. Update IFMEAInterface type
-Remove modes, modesLoading, modesGenerated — those fields supported the old generate-your-own-modes flow. Add focusFn so each interface knows which DFMEA focus function's modes to use.
-Before:
-Ts
-After:
-Ts
-You can also delete IFMEAModeRec type entirely since it's no longer needed.
-2. Update the bConns sync useEffect
-This is where ifmeaInterfaces is built from bConns. The interface must know which focus function it connects through. The B-diagram has lower → focus → higher connections. For a connection between a lower element and the focus, the focus function is implicit (all focus functions apply). For lower → higher connections that pass through the focus, same logic.
-The simplest reliable approach: don't try to auto-detect the focus function from the connection keys. Instead store focusFn: "" and focusFnId: "" initially, and let the user select it per interface in Phase 1. This is cleaner because one B-diagram connection can be relevant to multiple focus functions.
-Ts
-3. Add updateIfmeaFocusFn helper
-After updateIfmeaTransfer:
-Ts
-4. Update generateIfmeaCauses
-Replace failure_modes: selectedModes (which was from iface.modes) with dfmea_failure_modes read from modesByFocus[iface.focusFnId]. Also add focus_function to the request body.
-Before:
-Ts
-After:
-Ts
-5. Update buildIfmeaRows — pass interface_cause to effects endpoint
-The updated effects endpoint now accepts interface_cause for a richer prompt. Add it to the row payload:
-Ts
-6. Replace Phase 1 UI entirely
-This is the biggest visible change. Phase 1 no longer has a "Generate modes" button. Replace the entire ifmeaPhase === "modes" block with this logic:
-What to show per interface card:
-Header: same as before (connection type badge, from → to, connection label)
-Nominal transfer input: same as before
-Focus function selector: a <select> or set of radio pills showing all focus functions. The user picks which focus function this interface relates to.
-DFMEA modes display: once a focus function is selected, show the modes already selected in Step 6 for that function as a read-only list with tick icons. These are the modes that will be used for cause generation — no generate button, no checkboxes.
-Warning if focus function has no selected modes yet: "No failure modes selected for this function yet — go to Step 6 first."
-Tsx
-7. Update generateIfmeaCauses guard condition
-The old guard was !selectedModes.length || !iface.nominalTransfer.trim(). The new guard is:
-Ts
-8. Delete fetchIfmeaModes handler
-The entire fetchIfmeaModes async function can be deleted — it calls /api/ifmea/interface-failure-modes which no longer exists in the backend.
-9. Update the Phase tab label
-Change "1. Failure Modes" to "1. Set Up Interfaces" in the phase tabs array to reflect that this phase now configures rather than generates:
-Ts
-Summary of what gets removed vs added
-Removed:
-modes, modesLoading, modesGenerated fields on IFMEAInterface
-IFMEAModeRec type
-fetchIfmeaModes async function (~20 lines)
-"Generate modes" button per interface card
-The iface.modes.filter(m => m.selected) logic in generateIfmeaCauses
-Added:
-focusFn and focusFnId fields on IFMEAInterface
-updateIfmeaFocusFn helper (~6 lines)
-Focus function pill selector per interface card
-Read-only DFMEA modes display per interface card
-dfmea_failure_modes and focus_function in the cause generation request body
-interface_cause in the effects request body
+const updateIfmeaFocusFn = (id: string, focusFnId: string) => {
+  const ff = focusFunctions.find(f => f.id === focusFnId);
+  setIfmeaInterfaces(p => p.map(i =>
+    i.id !== id ? i : { ...i, focusFnId, focusFn: ff?.name ?? "" }
+  ));
+};// Get the DFMEA failure modes for this interface's focus function
+const dfmeaModes = Array.from(modesByFocus[iface.focusFnId]?.selected ?? []);
+if (!dfmeaModes.length || !iface.nominalTransfer.trim() || !iface.focusFnId) continue;
+// ...
+body: JSON.stringify({
+  from_element:        iface.fromElement,
+  to_element:          iface.toElement,
+  connection_type:     iface.connType,
+  nominal_transfer:    iface.nominalTransfer,
+  focus_function:      iface.focusFn,
+  dfmea_failure_modes: dfmeaModes,       // renamed field, new backend expects this
+  noise_factors:       cleanNoise,
+}),body: JSON.stringify({
+  rows: draft.map(row => ({
+    row_id:           row.id,
+    from_element:     row.from_element,
+    to_element:       row.to_element,
+    connection_type:  row.conn_type,
+    nominal_transfer: row.nominal_transfer,
+    failure_mode:     row.failure_mode,
+    interface_cause:  row.failure_cause,  // add this line
+  })),
+}),{ifmeaPhase === "modes" && (
+  <div className="space-y-4">
+    <p className="text-xs text-muted-foreground">
+      For each interface, describe what is transferred and select which focus
+      function it relates to. The DFMEA failure modes for that function will
+      be used as the interface failure modes — no separate generation needed.
+    </p>
+    {ifmeaInterfaces.map(iface => {
+      const meta = CONN_META[iface.connType];
+      const dfmeaModes = Array.from(modesByFocus[iface.focusFnId]?.selected ?? []);
+      return (
+        <Card key={iface.id} className="border">
+          <CardContent className="p-4 space-y-3">
+            {/* Interface header */}
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className="px-2 py-0.5 rounded text-xs font-bold text-white"
+                style={{ background: meta.color }}>{iface.connType}</span>
+              <span className="font-semibold text-sm">{iface.fromElement}</span>
+              <ArrowRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+              <span className="font-semibold text-sm">{iface.toElement}</span>
+              <span className="text-xs text-muted-foreground">({meta.label})</span>
+              {dfmeaModes.length > 0 && (
+                <Badge variant="default" className="ml-auto">
+                  {dfmeaModes.length} DFMEA modes
+                </Badge>
+              )}
+            </div>
+
+            {/* Nominal transfer */}
+            <div className="space-y-1">
+              <Label className="text-xs font-semibold">
+                What is nominally transferred through this interface?
+              </Label>
+              <Input className="text-sm"
+                placeholder={...} // same placeholders as before
+                value={iface.nominalTransfer}
+                onChange={e => updateIfmeaTransfer(iface.id, e.target.value)} />
+            </div>
+
+            {/* Focus function selector */}
+            <div className="space-y-1.5">
+              <Label className="text-xs font-semibold">
+                Which focus function does this interface support?
+              </Label>
+              <div className="flex flex-wrap gap-2">
+                {focusFunctions.map(ff => (
+                  <button key={ff.id} type="button"
+                    onClick={() => updateIfmeaFocusFn(iface.id, ff.id)}
+                    className={`text-xs px-3 py-1.5 rounded-lg border transition-all ${
+                      iface.focusFnId === ff.id
+                        ? "bg-primary text-primary-foreground border-primary"
+                        : "bg-white text-gray-600 border-gray-300 hover:border-primary/40"
+                    }`}>
+                    {ff.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* DFMEA modes — read only, derived from modesByFocus */}
+            {iface.focusFnId && (
+              <div className="space-y-1.5">
+                <Label className="text-xs font-semibold text-muted-foreground">
+                  DFMEA failure modes for this interface (from Step 6)
+                </Label>
+                {dfmeaModes.length === 0 ? (
+                  <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    No failure modes selected for this function yet. Go to Step 6 and generate modes first.
+                  </p>
+                ) : (
+                  <div className="space-y-1">
+                    {dfmeaModes.map((mode, mi) => (
+                      <div key={mi}
+                        className="flex items-start gap-2 px-3 py-2 rounded-lg bg-primary/5 border border-primary/20 text-sm">
+                        <CheckCircle2 className="h-3.5 w-3.5 text-primary mt-0.5 shrink-0" />
+                        <span className="text-gray-700">{mode}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      );
+    })}
+    <div className="flex justify-end">
+      <Button onClick={() => setIfmeaPhase("causes")}>
+        Next: Generate Causes <ArrowRight className="h-4 w-4 ml-2" />
+      </Button>
+    </div>
+  </div>
+)}if (!iface.focusFnId || !iface.nominalTransfer.trim()) continue;
+const dfmeaModes = Array.from(modesByFocus[iface.focusFnId]?.selected ?? []);
+if (!dfmeaModes.length) continue;
